@@ -4,25 +4,58 @@
 -- Restrictions (from Blizzard's generated API docs for the forever branch):
 -- PlaceBid and StartCommoditiesPurchase require a hardware event, so both are
 -- only ever called from a button click (see Buyer:OnClick).
+--
+-- Scanning uses a "summary" browse query rather than ReplicateItems: an empty
+-- browse query returns every item on the Auction House with its lowest unit
+-- buyout, in pages, and isn't limited to once per 15 minutes. GoldScout (MIT)
+-- documents this approach for Forever, along with the Sell tab quirk below.
 local _, ns = ...
 
 local C_AuctionHouse = C_AuctionHouse
-if not (C_AuctionHouse and C_AuctionHouse.ReplicateItems) then return end
+if not (C_AuctionHouse and C_AuctionHouse.SendBrowseQuery) then return end
 
 local M = {
   name = "modern",
-  firstIndex = 0,          -- replicate indices are 0-based
-  gearPriceByLink = true,  -- read gear sell prices from the exact item link
+  firstIndex = 1,
+  gearPriceByLink = false, -- browse results carry no link; the live search re-checks with real links
 }
 ns.backend = M
 
 local SEARCH_TIMEOUT = 10
 local PURCHASE_TIMEOUT = 5
-local FULL_SCAN_TIMEOUT = 180 -- Forever mega-realms can have very large auction houses
+local PAGE_TIMEOUT = 20
 local MAX_RESULT_PAGES = 5
 
 local SORT_PRICE = (Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price) or 0
 local SEARCH_SORTS = { { sortOrder = SORT_PRICE, reverseSort = false } }
+local SUMMARY_QUERY = { searchString = "", sorts = {}, filters = {}, itemClassFilters = {} }
+
+---------------------------------------------------------------------------
+-- Blizzard's Sell tab re-checks its Post button whenever an Auction House
+-- request goes out and errors while its item has no deposit yet, so we hold
+-- requests while a Sell tab is visible.
+---------------------------------------------------------------------------
+local sellFrames
+
+function M:SellTabOpen()
+  local ah = AuctionHouseFrame
+  if not ah then return false end
+  if not sellFrames then
+    sellFrames = {}
+    for _, key in ipairs({ "ItemSellFrame", "CommoditiesSellFrame" }) do
+      if type(ah[key]) == "table" then sellFrames[#sellFrames + 1] = ah[key] end
+    end
+    if #sellFrames == 0 and ah.GetChildren then
+      for _, child in ipairs({ ah:GetChildren() }) do
+        if type(child.CanPostItem) == "function" then sellFrames[#sellFrames + 1] = child end
+      end
+    end
+  end
+  for _, frame in ipairs(sellFrames) do
+    if frame:IsVisible() then return true end
+  end
+  return false
+end
 
 ---------------------------------------------------------------------------
 -- Throttle: the AH only accepts a query when its message system is ready.
@@ -31,20 +64,38 @@ local queued
 local queueTicker
 
 local function RunQueued()
-  if queued and C_AuctionHouse.IsThrottledMessageSystemReady() then
-    local fn = queued
+  if not queued then return end
+  if not ns.ahOpen then
     queued = nil
-    if queueTicker then queueTicker:Cancel() queueTicker = nil end
-    fn()
+  elseif M:SellTabOpen() then
+    if not M.sellPauseSaid then
+      M.sellPauseSaid = true
+      local msg = "Paused while the Auction House Sell tab is open."
+      if ns.Scan.running then
+        ns.Scan.statusText = msg
+        ns.Fire("SCAN_STATUS", msg)
+      else
+        ns.Buyer.message = msg
+        ns.Fire("BUYER_CHANGED")
+      end
+    end
+    return
+  elseif not C_AuctionHouse.IsThrottledMessageSystemReady() then
+    return
   end
+  local fn = queued
+  queued = nil
+  M.sellPauseSaid = false
+  if queueTicker then queueTicker:Cancel() queueTicker = nil end
+  if fn then fn() end
 end
 
 local function WhenReady(fn)
   queued = fn
-  if C_AuctionHouse.IsThrottledMessageSystemReady() then
-    RunQueued()
-  elseif not queueTicker then
-    -- AUCTION_HOUSE_THROTTLED_SYSTEM_READY normally wakes us; poll as a fallback.
+  RunQueued()
+  if queued and not queueTicker then
+    -- AUCTION_HOUSE_THROTTLED_SYSTEM_READY normally wakes us; poll as a fallback
+    -- (and to notice when the Sell tab closes).
     queueTicker = C_Timer.NewTicker(0.25, RunQueued)
   end
 end
@@ -52,77 +103,101 @@ end
 ns.On("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", RunQueued)
 
 ---------------------------------------------------------------------------
--- Full scan (ReplicateItems)
+-- Summary scan (empty browse query, paged)
 ---------------------------------------------------------------------------
-function M:CanFullScan(force)
-  local wait = ns.SecondsUntilFullScan()
-  if wait > 0 and not force then
-    return false, ("Full scans are limited to one every 15 minutes. Next scan in %d:%02d (shift-click Scan to try anyway).")
-      :format(math.floor(wait / 60), wait % 60)
-  end
+function M:CanFullScan()
   return true
 end
 
-function M:RequestFullScan(cb)
-  self.scanCallback = cb
-  self.lastReplicateEvent = nil
-  if self.scanTimer then self.scanTimer:Cancel() end
-  self.scanTimer = C_Timer.NewTimer(FULL_SCAN_TIMEOUT, function()
-    self:CompleteFullScanRequest(false,
-      "no data from the server. Full scans are limited to one every 15 minutes; try again later.")
+-- cb(success, err) once every page has arrived; onProgress(pages, items) per page.
+function M:RequestFullScan(cb, onProgress)
+  self:CancelAll()
+  local scan = { cb = cb, onProgress = onProgress, pages = 0, seen = 0 }
+  self.summary = scan
+  self.browse = {}
+  self.partial = false
+  self:RequestPage(scan, "first", function() C_AuctionHouse.SendBrowseQuery(SUMMARY_QUERY) end)
+end
+
+function M:RequestPage(scan, kind, send)
+  WhenReady(function()
+    if self.summary ~= scan then return end
+    scan.waiting = kind
+    if scan.timer then scan.timer:Cancel() end
+    scan.timer = C_Timer.NewTimer(PAGE_TIMEOUT, function()
+      if self.summary ~= scan then return end
+      if #self.browse > 0 then
+        -- Keep what arrived; the scan is just incomplete.
+        self.partial = true
+        self:CompleteFullScanRequest(true)
+      else
+        self:CompleteFullScanRequest(false, "the Auction House stopped responding; try again.")
+      end
+    end)
+    send()
   end)
-  C_AuctionHouse.ReplicateItems()
 end
 
 function M:CompleteFullScanRequest(success, err)
-  local cb = self.scanCallback
-  self.scanCallback = nil
-  if self.scanTimer then self.scanTimer:Cancel() self.scanTimer = nil end
-  if cb then cb(success, err) end
+  local scan = self.summary
+  if not scan then return end
+  self.summary = nil
+  if scan.timer then scan.timer:Cancel() end
+  scan.cb(success, err)
 end
 
--- The list can arrive in several updates; wait until it has been quiet briefly.
-local function CheckReplicateSettled()
-  if not M.scanCallback then return end
-  if GetTime() - (M.lastReplicateEvent or 0) >= 0.5 then
+-- Browse results are cumulative, so only a longer list means a new page.
+local function OnBrowseResults()
+  local scan = M.summary
+  if not (scan and scan.waiting) then return end
+  local all = C_AuctionHouse.GetBrowseResults() or {}
+  if scan.waiting == "more" and #all <= scan.seen then return end
+  scan.waiting = nil
+  scan.seen = #all
+  scan.pages = scan.pages + 1
+  M.browse = all
+  if scan.onProgress then scan.onProgress(scan.pages, #all) end
+  if C_AuctionHouse.HasFullBrowseResults() then
     M:CompleteFullScanRequest(true)
   else
-    C_Timer.After(0.25, CheckReplicateSettled)
+    M:RequestPage(scan, "more", function() C_AuctionHouse.RequestMoreBrowseResults() end)
   end
 end
 
-ns.On("REPLICATE_ITEM_LIST_UPDATE", function()
-  if not M.scanCallback then return end
-  local first = M.lastReplicateEvent == nil
-  M.lastReplicateEvent = GetTime()
-  if first then C_Timer.After(0.5, CheckReplicateSettled) end
+ns.On("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", OnBrowseResults)
+ns.On("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", OnBrowseResults)
+ns.On("AUCTION_HOUSE_BROWSE_FAILURE", function()
+  local scan = M.summary
+  if scan and scan.waiting then
+    M:CompleteFullScanRequest(false, "the Auction House refused the request; try again in a moment.")
+  end
 end)
 
+-- Scan.lua reads the snapshot through these. Each entry is one item key with
+-- its lowest unit price, so we report it as a single unit at that price.
 function M:GetCount()
-  return C_AuctionHouse.GetNumReplicateItems() or 0
+  return #self.browse
 end
 
 function M:ReadEntry(i)
-  local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
-  return itemID, count, buyout
+  local r = self.browse[i]
+  if not (r and r.itemKey) then return nil end
+  return r.itemKey.itemID, 1, r.minPrice
 end
 
-function M:GetEntryLink(i)
-  return C_AuctionHouse.GetReplicateItemLink(i)
+function M:GetEntryLink()
+  return nil
 end
 
-function M:DescribeEntry(i, itemID, isGear, link)
-  local name, texture, _, quality, _, _, _, _, _, _, _, _, _, owner = C_AuctionHouse.GetReplicateItemInfo(i)
-  if not name or name == "" then return nil end
-  if owner and owner ~= "" and owner == UnitName("player") then return false end
-  link = link or C_AuctionHouse.GetReplicateItemLink(i)
-
-  local key, itemLevel = tostring(itemID), nil
-  if isGear and link then
-    -- Gear with different item levels has different item keys on the AH.
-    itemLevel = ns.GetDetailedItemLevelInfo(link)
-    if itemLevel then key = itemID .. ":" .. itemLevel end
-  end
+function M:DescribeEntry(i, itemID)
+  local r = self.browse[i]
+  local name, link, quality, _, _, _, _, _, _, texture = ns.GetItemInfo(itemID)
+  if not name then return nil end
+  local itemKey = r.itemKey
+  local key = tostring(itemID)
+  local itemLevel = (itemKey.itemLevel or 0) > 0 and itemKey.itemLevel or nil
+  if itemLevel then key = key .. ":" .. itemLevel end
+  if (itemKey.itemSuffix or 0) > 0 then key = key .. ":s" .. itemKey.itemSuffix end
   return key, {
     itemID = itemID,
     name = name,
@@ -130,6 +205,9 @@ function M:DescribeEntry(i, itemID, isGear, link)
     texture = texture,
     quality = quality,
     itemLevel = itemLevel,
+    itemKey = itemKey,
+    listed = r.totalQuantity,
+    estimate = true,
   }
 end
 
@@ -143,6 +221,8 @@ end
 function M:CancelAll()
   if self.search and self.search.timer then self.search.timer:Cancel() end
   self.search = nil
+  if self.summary and self.summary.timer then self.summary.timer:Cancel() end
+  self.summary = nil
   if self.purchase then
     if self.purchase.timer then self.purchase.timer:Cancel() end
     if self.purchase.kind == "commodity" and C_AuctionHouse.CancelCommoditiesPurchase then
@@ -162,18 +242,21 @@ function M:Search(cand, cb)
     pages = 0,
     reads = 0,
   }
-  s.itemKey = C_AuctionHouse.MakeItemKey(cand.itemID, cand.itemLevel or 0, 0, 0)
+  -- The browse scan gives us the exact item key; otherwise build one.
+  s.itemKey = cand.itemKey or C_AuctionHouse.MakeItemKey(cand.itemID, cand.itemLevel or 0, 0, 0)
   self.search = s
   self:SendSearch(s)
 end
 
 function M:SendSearch(s)
-  if s.timer then s.timer:Cancel() end
-  s.timer = C_Timer.NewTimer(SEARCH_TIMEOUT, function()
-    if self.search == s then self:FinishSearch(s, nil, "the search timed out.") end
-  end)
   WhenReady(function()
     if self.search ~= s then return end
+    -- Start the timeout only once the query really goes out (it may have
+    -- waited for the throttle or the Sell tab).
+    if s.timer then s.timer:Cancel() end
+    s.timer = C_Timer.NewTimer(SEARCH_TIMEOUT, function()
+      if self.search == s then self:FinishSearch(s, nil, "the search timed out.") end
+    end)
     C_AuctionHouse.SendSearchQuery(s.itemKey, SEARCH_SORTS, true)
   end)
 end
@@ -255,13 +338,6 @@ function M:OnItemResults(itemKey)
   if not s or not SameItem(itemKey, s.itemID) then return end
 
   local n = C_AuctionHouse.GetNumItemSearchResults(itemKey) or 0
-  if n == 0 and (s.itemKey.itemLevel or 0) ~= 0 and not s.triedAnyLevel then
-    -- No match for that exact item level; retry with a generic key.
-    s.triedAnyLevel = true
-    s.itemKey = C_AuctionHouse.MakeItemKey(s.itemID)
-    self:SendSearch(s)
-    return
-  end
 
   local offers, live = {}, {}
   local missingData, lastWasDeal = false, false
@@ -406,6 +482,6 @@ ns.On("AUCTION_HOUSE_SHOW_ERROR", function()
 end)
 
 ns.Listen("AH_CLOSED", function()
-  if M.scanCallback then M:CompleteFullScanRequest(false, "the Auction House was closed.") end
+  if M.summary then M:CompleteFullScanRequest(false, "the Auction House was closed.") end
   M:CancelAll()
 end)

@@ -12,12 +12,11 @@ local SCROLLBAR_WIDTH = 18
 local LIST_TOP = -118
 
 local COLUMNS = {
-  { key = "name",     title = "Item",   width = 238, justify = "LEFT" },
-  { key = "auctions", title = "#",      width = 36,  justify = "RIGHT" },
-  { key = "quantity", title = "Qty",    width = 50,  justify = "RIGHT" },
-  { key = "cost",     title = "Cost",   width = 92,  justify = "RIGHT" },
-  { key = "vendor",   title = "Vendor", width = 92,  justify = "RIGHT" },
-  { key = "profit",   title = "Profit", width = 96,  justify = "RIGHT" },
+  { key = "name",     title = "Item",      width = 252, justify = "LEFT" },
+  { key = "quantity", title = "Qty",       width = 60,  justify = "RIGHT" },
+  { key = "price",    title = "Price ea",  width = 96,  justify = "RIGHT" },
+  { key = "vendor",   title = "Vendor ea", width = 96,  justify = "RIGHT" },
+  { key = "profit",   title = "Profit",    width = 100, justify = "RIGHT" },
 }
 local LIST_WIDTH = 0
 for _, col in ipairs(COLUMNS) do LIST_WIDTH = LIST_WIDTH + col.width end
@@ -106,12 +105,13 @@ function UI:Build()
   scan:SetSize(110, 22)
   scan:SetPoint("TOPLEFT", f, "TOPLEFT", SIDE + 2, -44)
   scan:SetText("Scan")
-  scan:SetScript("OnClick", function() ns.Scan:Start(IsShiftKeyDown()) end)
+  scan:SetScript("OnClick", function() ns.Scan:Start() end)
   scan:SetScript("OnEnter", function(btn)
     GameTooltip:SetOwner(btn, "ANCHOR_TOP")
-    GameTooltip:SetText("Full Auction House scan")
-    GameTooltip:AddLine("Reads every listing and finds buyouts below the vendor sell price.", 1, 1, 1, true)
-    GameTooltip:AddLine("The server allows one full scan every 15 minutes.", 1, 1, 1, true)
+    GameTooltip:SetText("Scan the Auction House")
+    GameTooltip:AddLine("Reads the lowest price of every item on the Auction House and lists those "
+      .. "below the vendor sell price. You can scan as often as you like.", 1, 1, 1, true)
+    GameTooltip:AddLine("Quantities and total profit fill in when you select an item.", 1, 1, 1, true)
     GameTooltip:Show()
   end)
   scan:SetScript("OnLeave", GameTooltip_Hide)
@@ -349,11 +349,21 @@ function UI:OnRowEnter(row)
     GameTooltip:SetItemByID(cand.itemID)
   end
   GameTooltip:AddLine(" ")
-  GameTooltip:AddDoubleLine(cand.live and "Live listings:" or "Listings (from scan):", cand.auctions, 1, 0.82, 0, 1, 1, 1)
-  GameTooltip:AddDoubleLine("Quantity:", cand.quantity, 1, 0.82, 0, 1, 1, 1)
-  GameTooltip:AddDoubleLine("Buyout total:", ns.FormatMoney(cand.cost), 1, 0.82, 0, 1, 1, 1)
-  GameTooltip:AddDoubleLine("Vendor value:", ns.FormatMoney(cand.vendor), 1, 0.82, 0, 1, 1, 1)
-  GameTooltip:AddDoubleLine("Profit:", ns.FormatMoney(cand.profit), 1, 0.82, 0, 0.2, 1, 0.2)
+  local function Line(label, value, r, g, b)
+    GameTooltip:AddDoubleLine(label, value, 1, 0.82, 0, r or 1, g or 1, b or 1)
+  end
+  if cand.estimate then
+    Line("Lowest price:", ns.FormatMoney(cand.unitPrice) .. " each")
+    Line("Vendor price:", ns.FormatMoney(cand.unitVendor) .. " each")
+    Line("Profit:", "at least " .. ns.FormatMoney(cand.profit), 0.2, 1, 0.2)
+    if cand.listed then Line("Listed in total:", cand.listed) end
+    GameTooltip:AddLine("Click to check how many are below vendor price.", 0.6, 0.8, 1, true)
+  else
+    Line("Below vendor price:", ("%d listings, %d units"):format(cand.auctions, cand.quantity))
+    Line("Buyout total:", ns.FormatMoney(cand.cost))
+    Line("Vendor value:", ns.FormatMoney(cand.vendor))
+    Line("Profit:", ns.FormatMoney(cand.profit), 0.2, 1, 0.2)
+  end
   GameTooltip:Show()
 end
 
@@ -403,11 +413,16 @@ function UI:RefreshRows()
       local name = cand.name or ("item:" .. cand.itemID)
       if cand.itemLevel then name = name .. " (" .. cand.itemLevel .. ")" end
       row.cells[1]:SetText(ns.QualityColor(cand.quality) .. name .. "|r")
-      row.cells[2]:SetText(cand.auctions)
-      row.cells[3]:SetText(cand.quantity)
-      row.cells[4]:SetText(ns.FormatMoney(cand.cost))
-      row.cells[5]:SetText(ns.FormatMoney(cand.vendor))
-      row.cells[6]:SetText("|cff33ff33" .. ns.FormatMoney(cand.profit) .. "|r")
+      row.cells[3]:SetText(ns.FormatMoney(cand.unitPrice))
+      row.cells[4]:SetText(ns.FormatMoney(cand.unitVendor))
+      if cand.estimate then
+        -- From the scan we only know the lowest price: show per-unit profit.
+        row.cells[2]:SetText("|cff999999?|r")
+        row.cells[5]:SetText("|cff33ff33" .. ns.FormatMoney(cand.profit) .. "|r|cff999999 ea|r")
+      else
+        row.cells[2]:SetText(cand.quantity)
+        row.cells[5]:SetText("|cff33ff33" .. ns.FormatMoney(cand.profit) .. "|r")
+      end
       if cand.key == selectedKey then row.selected:Show() else row.selected:Hide() end
       row:Show()
     else
@@ -432,10 +447,9 @@ function UI:RefreshRows()
 end
 
 function UI:RefreshTotals()
-  local count, profit, cost = ns.Results:Totals()
+  local count, profit = ns.Results:Totals()
   if count > 0 then
-    self.totals:SetText(("%d items  |  cost %s  |  |cff33ff33profit %s|r"):format(
-      count, ns.FormatMoney(cost), ns.FormatMoney(profit)))
+    self.totals:SetText(("%d items  |  |cff33ff33profit at least %s|r"):format(count, ns.FormatMoney(profit)))
   else
     self.totals:SetText("")
   end
@@ -449,7 +463,7 @@ function UI:RefreshScan()
     self.scanButton:Enable()
   end
   if scanning and ns.Scan.total > 0 then
-    self.scanStatus:SetText(("Scanning... %d / %d auctions"):format(ns.Scan.progress, ns.Scan.total))
+    self.scanStatus:SetText(("Checking vendor prices... %d / %d items"):format(ns.Scan.progress, ns.Scan.total))
   else
     local text = ns.Scan.statusText
     if not text then
@@ -458,12 +472,7 @@ function UI:RefreshScan()
       elseif not ns.ahOpen then
         text = "Open the Auction House to scan."
       else
-        local wait = ns.SecondsUntilFullScan()
-        if wait > 0 then
-          text = ("Next full scan in %d:%02d"):format(math.floor(wait / 60), wait % 60)
-        else
-          text = "Ready to scan."
-        end
+        text = "Ready to scan."
       end
     end
     self.scanStatus:SetText(text)
@@ -567,9 +576,3 @@ ns.Listen("AH_CLOSED", function()
   end
 end)
 
--- Keep the "next scan in m:ss" countdown fresh while the window is open.
-C_Timer.NewTicker(1, function()
-  if UI.frame and UI.frame:IsShown() and not ns.Scan.running and ns.ahOpen then
-    UI:RefreshScan()
-  end
-end)

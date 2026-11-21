@@ -4,10 +4,11 @@
 -- Backend contract:
 --   backend.firstIndex            0 or 1
 --   backend.gearPriceByLink       true if gear vendor price should come from the item link
---   backend:CanFullScan(force)    -> ok, reason
---   backend:RequestFullScan(cb)   cb(success, err) once data is available
+--   backend:CanFullScan()         -> ok, reason
+--   backend:RequestFullScan(cb, onProgress)
+--                                 cb(success, err) once data is available; onProgress(pages, items)
 --   backend:GetCount()            number of entries available right now
---   backend:ReadEntry(i)          -> itemID, count, buyout (cheap, called for every auction)
+--   backend:ReadEntry(i)          -> itemID, count, buyout (cheap, called for every entry)
 --   backend:GetEntryLink(i)       -> item link
 --   backend:DescribeEntry(i, itemID, isGear, link)
 --                                 -> key, info  | nil (data not loaded yet) | false (skip, e.g. own auction)
@@ -32,7 +33,7 @@ local function Status(text)
   ns.Fire("SCAN_STATUS", text)
 end
 
-function Scan:Start(force)
+function Scan:Start()
   if self.running then
     ns.Print("A scan is already running.")
     return
@@ -47,7 +48,7 @@ function Scan:Start(force)
     ns.Print("This game client has no Auction House API Vendor Diff understands.")
     return
   end
-  local ok, reason = backend:CanFullScan(force)
+  local ok, reason = backend:CanFullScan()
   if not ok then
     Status(reason)
     ns.Print(reason)
@@ -59,8 +60,7 @@ function Scan:Start(force)
   self.running = true
   self.token = self.token + 1
   self.progress, self.total = 0, 0
-  ns.db.lastFullScan[ns.RealmKey()] = time()
-  Status("Requesting a full scan from the server...")
+  Status("Reading the Auction House...")
   ns.Fire("SCAN_STARTED")
 
   local token = self.token
@@ -71,6 +71,9 @@ function Scan:Start(force)
     else
       self:BeginProcessing()
     end
+  end, function(pages, items)
+    if token ~= self.token then return end
+    Status(("Reading the Auction House... page %d, %d items"):format(pages, items))
   end)
 end
 
@@ -90,7 +93,7 @@ function Scan:BeginProcessing()
   self.retryPass = 0
   self.stalled = 0
   self.startedAt = GetTime()
-  Status("Processing auctions...")
+  Status("Checking vendor prices...")
   self:ProcessChunk(self.token)
 end
 
@@ -181,7 +184,7 @@ function Scan:ScheduleRetry(token)
     self:Finish(true)
     return
   end
-  Status(("Waiting for item data (%d auctions)..."):format(#self.pending))
+  Status(("Waiting for item data (%d items)..."):format(#self.pending))
   C_Timer.After(RETRY_DELAY, function() self:RetryChunk(token, 1, {}) end)
 end
 
@@ -227,10 +230,13 @@ function Scan:Finish(success, err)
   if success then
     local count, profit = ns.Results:Totals()
     local skipped = self.pending and #self.pending or 0
-    local msg = ("Scan complete: %d auctions checked, %d items below vendor price (%s potential profit)."):format(
+    local msg = ("Scan complete: %d items checked, %d listed below vendor price (at least %s profit)."):format(
       self.checked or 0, count, ns.FormatMoney(profit))
     if skipped > 0 then
-      msg = msg .. (" %d auctions skipped (item data never loaded)."):format(skipped)
+      msg = msg .. (" %d items skipped (item data never loaded)."):format(skipped)
+    end
+    if ns.backend.partial then
+      msg = msg .. " The Auction House stopped responding partway, so some items may be missing."
     end
     Status(msg)
     ns.Print(msg)

@@ -24,7 +24,7 @@ end
 ---------------------------------------------------------------------------
 local COMMON = {
   "SetSize", "SetWidth", "SetHeight", "GetWidth", "GetHeight", "SetPoint", "ClearAllPoints",
-  "GetPoint", "SetAllPoints", "Show", "Hide", "IsShown", "SetShown",
+  "GetPoint", "SetAllPoints", "Show", "Hide", "IsShown", "IsVisible", "SetShown",
 }
 local FRAME = {
   "SetScript", "GetScript", "CreateFontString", "CreateTexture", "RegisterEvent", "UnregisterEvent",
@@ -130,6 +130,7 @@ function Widget:IsShown()
   end
   return true
 end
+function Widget:IsVisible() return self:IsShown() end
 function Widget:SetShown(v) if v then self:Show() else self:Hide() end end
 function Widget:SetScript(name, fn) self._scripts[name] = fn end
 function Widget:GetScript(name) return self._scripts[name] end
@@ -164,7 +165,9 @@ end
 ---------------------------------------------------------------------------
 local MODERN_EVENTS = {
   "ADDON_LOADED", "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED", "GET_ITEM_INFO_RECEIVED",
-  "UI_ERROR_MESSAGE", "REPLICATE_ITEM_LIST_UPDATE", "AUCTION_HOUSE_THROTTLED_SYSTEM_READY",
+  "UI_ERROR_MESSAGE", "AUCTION_HOUSE_THROTTLED_SYSTEM_READY",
+  "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED", "AUCTION_HOUSE_BROWSE_FAILURE",
+  "PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
   "COMMODITY_SEARCH_RESULTS_UPDATED", "COMMODITY_SEARCH_RESULTS_ADDED", "ITEM_SEARCH_RESULTS_UPDATED",
   "ITEM_SEARCH_RESULTS_ADDED", "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE",
   "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED", "AUCTION_HOUSE_PURCHASE_COMPLETED",
@@ -397,7 +400,11 @@ function World:BuildEnv()
   env.UnitName = function() return world.playerName end
   env.GetRealmName = function() return "TestRealm" end
   env.GetMoney = function() return world.money end
-  env.Enum = { AuctionHouseSortOrder = { Price = 0 }, ItemClass = { Weapon = 2, Armor = 4 } }
+  env.Enum = {
+    AuctionHouseSortOrder = { Price = 0 },
+    ItemClass = { Weapon = 2, Armor = 4 },
+    PlayerInteractionType = { Auctioneer = 21 },
+  }
   env.ITEM_QUALITY_COLORS = {}
   for q = 0, 8 do env.ITEM_QUALITY_COLORS[q] = { hex = "|cffq" .. q } end
 
@@ -438,18 +445,32 @@ end
 ---------------------------------------------------------------------------
 -- Modern AH (C_AuctionHouse)
 ---------------------------------------------------------------------------
--- world.replicate: array of { itemID, count, buyout, owner, ilvl }
 -- world.commodities[itemID]: array of { unitPrice, quantity, numOwnerItems }
--- world.itemAuctions[itemID]: array of { auctionID, buyout, quantity, ilvl, own }
+-- world.itemAuctions[itemID]: array of { auctionID, buyout (nil = bid only), bid, quantity, ilvl, own }
+-- The browse ("summary") scan is derived from the same data, so scan and live
+-- search always agree, like on the real server.
 function World:BuildModernAH()
   local world, env = self, self.env
-  world.replicate = {}
   world.commodities = {}
   world.itemAuctions = {}
   world.throttleReady = true
   world.searchDelay = 0.2
-  world.respondToReplicate = true
-  rawset(env, "AuctionHouseFrame", Widget.new(world, "Frame", "AuctionHouseFrame"))
+  world.browsePageSize = 500
+  world.browseFail = false     -- reply with AUCTION_HOUSE_BROWSE_FAILURE
+  world.browseStallAfter = nil -- stop answering after this many pages
+  world.sellTabViolations = 0  -- AH requests sent while Blizzard's Sell tab was visible
+  local ah = Widget.new(world, "Frame", "AuctionHouseFrame")
+  rawset(ah, "ItemSellFrame", Widget.new(world, "Frame", nil, ah))
+  rawset(ah, "CommoditiesSellFrame", Widget.new(world, "Frame", nil, ah))
+  ah.ItemSellFrame:Hide()
+  ah.CommoditiesSellFrame:Hide()
+  rawset(env, "AuctionHouseFrame", ah)
+
+  local function sentRequest()
+    if ah.ItemSellFrame:IsVisible() or ah.CommoditiesSellFrame:IsVisible() then
+      world.sellTabViolations = world.sellTabViolations + 1
+    end
+  end
 
   local function isCommodity(id) return world.commodities[id] ~= nil end
   local function sortedCommodity(id)
@@ -462,33 +483,85 @@ function World:BuildModernAH()
     for _, a in ipairs(world.itemAuctions[itemKey.itemID] or {}) do
       if (itemKey.itemLevel or 0) == 0 or a.ilvl == itemKey.itemLevel then res[#res + 1] = a end
     end
-    table.sort(res, function(a, b) return a.buyout < b.buyout end)
+    table.sort(res, function(a, b) return (a.buyout or math.huge) < (b.buyout or math.huge) end)
     return res
+  end
+
+  local function buildBrowse()
+    local all = {}
+    for id, list in pairs(world.commodities) do
+      local minPrice, qty, own
+      for _, r in ipairs(list) do
+        if not minPrice or r.unitPrice < minPrice then minPrice = r.unitPrice end
+        qty = (qty or 0) + r.quantity
+        own = own or (r.numOwnerItems or 0) > 0
+      end
+      if minPrice then
+        all[#all + 1] = { itemKey = { itemID = id, itemLevel = 0, itemSuffix = 0, battlePetSpeciesID = 0 },
+                          minPrice = minPrice, totalQuantity = qty, containsOwnerItem = own or false }
+      end
+    end
+    for id, list in pairs(world.itemAuctions) do
+      local byIlvl = {}
+      for _, a in ipairs(list) do
+        local lvl = a.ilvl or 0
+        local e = byIlvl[lvl] or { qty = 0 }
+        byIlvl[lvl] = e
+        -- Pessimistic model: a bid-only auction reports its bid as the price.
+        local price = a.buyout or a.bid
+        if not e.minPrice or price < e.minPrice then e.minPrice = price end
+        e.qty = e.qty + (a.quantity or 1)
+      end
+      for lvl, e in pairs(byIlvl) do
+        all[#all + 1] = { itemKey = { itemID = id, itemLevel = lvl, itemSuffix = 0, battlePetSpeciesID = 0 },
+                          minPrice = e.minPrice, totalQuantity = e.qty, containsOwnerItem = false }
+      end
+    end
+    table.sort(all, function(a, b)
+      if a.itemKey.itemID ~= b.itemKey.itemID then return a.itemKey.itemID < b.itemKey.itemID end
+      return a.itemKey.itemLevel < b.itemKey.itemLevel
+    end)
+    return all
+  end
+
+  local function deliverPage(event)
+    world.browsePages = world.browsePages + 1
+    if world.browseStallAfter and world.browsePages > world.browseStallAfter then return end
+    local from = #world.browseShown + 1
+    for i = from, math.min(#world.browseAll, from + world.browsePageSize - 1) do
+      world.browseShown[#world.browseShown + 1] = world.browseAll[i]
+    end
+    world:FireLater(0.3, event)
   end
 
   local AH = {}
   env.C_AuctionHouse = AH
-  function AH.ReplicateItems()
-    world:Call("ReplicateItems")
-    if world.respondToReplicate then
-      world:FireLater(1, "REPLICATE_ITEM_LIST_UPDATE")
-      world:FireLater(1.2, "REPLICATE_ITEM_LIST_UPDATE")
+  function AH.SendBrowseQuery(query)
+    assert(world.throttleReady, "SendBrowseQuery while throttled")
+    assert(type(query) == "table" and query.searchString == "" and type(query.sorts) == "table",
+      "bad browse query")
+    sentRequest()
+    world:Call("SendBrowseQuery", query)
+    if world.browseFail then
+      world:FireLater(0.3, "AUCTION_HOUSE_BROWSE_FAILURE")
+      return
     end
+    world.browseAll, world.browseShown, world.browsePages = buildBrowse(), {}, 0
+    deliverPage("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
   end
-  function AH.GetNumReplicateItems() return #world.replicate end
-  function AH.GetReplicateItemInfo(i)
-    local e = world.replicate[i + 1]
-    if not e then return nil end
-    local d = world.items[e.itemID]
-    local loaded = world.now >= d.availableAt
-    return loaded and d.name or nil, d.texture, e.count, d.quality, true, 1, "", 0, 0, e.buyout, 0, false, nil,
-      e.owner or "Seller", e.owner or "Seller", 0, e.itemID, loaded
+  function AH.RequestMoreBrowseResults()
+    assert(world.throttleReady, "RequestMoreBrowseResults while throttled")
+    sentRequest()
+    world:Call("RequestMoreBrowseResults")
+    deliverPage("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
   end
-  function AH.GetReplicateItemLink(i)
-    local e = world.replicate[i + 1]
-    if not e then return nil end
-    if world.now < world.items[e.itemID].availableAt then return nil end
-    return world:ItemLink(e.itemID, e.ilvl)
+  function AH.HasFullBrowseResults()
+    return world.browseShown ~= nil and #world.browseShown >= #world.browseAll
+  end
+  function AH.GetBrowseResults()
+    local copyList = {}
+    for i, r in ipairs(world.browseShown or {}) do copyList[i] = r end
+    return copyList
   end
   function AH.MakeItemKey(itemID, itemLevel, itemSuffix, species)
     return { itemID = itemID, itemLevel = itemLevel or 0, itemSuffix = itemSuffix or 0, battlePetSpeciesID = species or 0 }
@@ -496,6 +569,7 @@ function World:BuildModernAH()
   function AH.IsThrottledMessageSystemReady() return world.throttleReady end
   function AH.SendSearchQuery(itemKey, sorts, separateOwnerItems)
     assert(world.throttleReady, "SendSearchQuery while throttled")
+    sentRequest()
     assert(type(sorts) == "table" and separateOwnerItems ~= nil, "bad SendSearchQuery args")
     world:Call("SendSearchQuery", itemKey)
     if isCommodity(itemKey.itemID) then
@@ -539,6 +613,7 @@ function World:BuildModernAH()
 
   function AH.StartCommoditiesPurchase(id, quantity)
     world:RequireHardware("StartCommoditiesPurchase") -- HasRestrictions in the Forever API docs
+    sentRequest()
     world:Call("StartCommoditiesPurchase", id, quantity)
     world.quote = { itemID = id, quantity = quantity }
     if world.priceBump then
@@ -558,6 +633,7 @@ function World:BuildModernAH()
   end
   function AH.ConfirmCommoditiesPurchase(id, quantity)
     world:RequireHardware("ConfirmCommoditiesPurchase")
+    sentRequest()
     world:Call("ConfirmCommoditiesPurchase", id, quantity)
     local total = commodityQuote(id, quantity)
     if not total or total > world.money then
@@ -580,6 +656,7 @@ function World:BuildModernAH()
   end
   function AH.PlaceBid(auctionID, amount)
     world:RequireHardware("PlaceBid") -- HasRestrictions in the Forever API docs
+    sentRequest()
     world:Call("PlaceBid", auctionID, amount)
     for id, list in pairs(world.itemAuctions) do
       for i, a in ipairs(list) do

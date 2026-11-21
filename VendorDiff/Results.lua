@@ -14,11 +14,16 @@ ns.Results = Results
 {
   key = "123" | "123:ilvl",
   itemID, name, link, texture, quality,
-  itemLevel,     -- gear: item level used to build the search item key
-  listings = { {count=, cost=, vendor=}, ... },  -- every listing below vendor price
+  itemLevel,     -- gear: item level, shown in the name
+  itemKey,       -- the Auction House item key from the scan, used for the live search
+  listed,        -- total quantity on the AH (all prices), from the scan
+  listings = { {count=, cost=, vendor=}, ... },  -- listings below vendor price
   -- derived from listings that pass the min-profit filter:
   auctions, quantity, cost, vendor, profit,
-  live = true when listings came from a live search rather than the full scan
+  unitPrice,     -- cheapest price per unit
+  unitVendor,    -- vendor price per unit
+  estimate = true until a live search has replaced the scan's lowest-price
+             summary with real listings (then quantity/profit are totals)
 }
 ]]
 
@@ -41,6 +46,9 @@ function Results:AddListing(key, info, count, cost, vendor)
       texture = info.texture,
       quality = info.quality,
       itemLevel = info.itemLevel,
+      itemKey = info.itemKey,
+      listed = info.listed,
+      estimate = info.estimate,
       listings = {},
     }
     self.byKey[key] = c
@@ -56,6 +64,7 @@ function Results:SetLiveListings(key, listings)
   if not c then return end
   c.listings = listings
   c.live = true
+  c.estimate = false
   self.dirty = true
   self:Rebuild()
 end
@@ -88,10 +97,9 @@ end
 
 local SORTERS = {
   name = function(c) return c.name or "" end,
-  auctions = function(c) return c.auctions end,
-  quantity = function(c) return c.quantity end,
-  cost = function(c) return c.cost end,
-  vendor = function(c) return c.vendor end,
+  quantity = function(c) return c.estimate and 0 or c.quantity end,
+  price = function(c) return c.unitPrice end,
+  vendor = function(c) return c.unitVendor end,
   profit = function(c) return c.profit end,
 }
 
@@ -116,6 +124,7 @@ function Results:Rebuild()
   wipe(self.sorted)
   for _, c in pairs(self.byKey) do
     local auctions, quantity, cost, vendor = 0, 0, 0, 0
+    local unitPrice
     if not ignore[c.itemID] then
       for _, l in ipairs(c.listings) do
         if l.vendor - l.cost >= minProfit then
@@ -123,11 +132,15 @@ function Results:Rebuild()
           quantity = quantity + l.count
           cost = cost + l.cost
           vendor = vendor + l.vendor
+          local unit = l.cost / l.count
+          if not unitPrice or unit < unitPrice then unitPrice = unit end
         end
       end
     end
     c.auctions, c.quantity, c.cost, c.vendor = auctions, quantity, cost, vendor
     c.profit = vendor - cost
+    c.unitPrice = unitPrice or 0
+    c.unitVendor = quantity > 0 and vendor / quantity or 0
     if auctions > 0 then
       self.sorted[#self.sorted + 1] = c
     end

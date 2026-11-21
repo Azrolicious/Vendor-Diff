@@ -37,6 +37,10 @@ function Buyer:CanAct()
   if not ns.backend then return false, "This client's Auction House isn't supported." end
   if not ns.ahOpen then return false, "Open the Auction House to buy." end
   if ns.Scan.running then return false, "Wait for the scan to finish." end
+  if ns.backend:SellTabOpen() then
+    -- Blizzard's Sell tab errors if Auction House requests go out while it's open.
+    return false, "Leave the Auction House Sell tab first."
+  end
   return true
 end
 

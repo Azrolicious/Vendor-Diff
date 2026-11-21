@@ -13,8 +13,9 @@ The TOC targets interface `16001` (Forever client 1.60.1). If the AddOns list ma
 ## Use
 
 1. Talk to an auctioneer. The Vendor Diff window opens next to the Auction House.
-2. Click **Scan**. This requests a full copy of every listing from the server, which allows one full scan every 15 minutes. The list fills with every item that has listings below vendor price, sorted by profit.
-3. Click **Start** (or click a row). Vendor Diff runs a live search for that item to confirm the listings still exist at that price.
+2. Click **Scan**. It reads the lowest price of every item on the Auction House in a few seconds, and you can scan as often as you like. The list fills with every item whose lowest price is below vendor price, sorted by profit.
+   - Until you select an item, the scan only knows its *lowest* price, so **Qty** shows `?` and **Profit** is per unit (`ea`).
+3. Click **Start** (or click a row). Vendor Diff runs a live search for that item to confirm the listings still exist at that price. The row then fills in the real quantity below vendor price and the total profit.
 4. Click **Buy**.
    - **Gear and other non-stacking items** are bought one auction per click.
    - **Commodities** (stackable goods like cloth and herbs) take two clicks. **Buy** asks the server for the exact total price of every unit below vendor price. **Confirm** buys them. If the price has risen above vendor value by then, the purchase is cancelled.
@@ -34,7 +35,6 @@ Every purchase needs a click: Blizzard only allows buying from the Auction House
 | Column header | Sort by that column (click again to reverse) |
 | **Min profit per listing** | Hide listings that beat vendor price by less than this, e.g. `50s`, `1g 20s` (press Enter) |
 | **Skip** | Drop the current item and move to the next |
-| Shift-click **Scan** | Try a full scan even if the 15-minute timer hasn't run out |
 
 ### Slash commands
 
@@ -52,7 +52,7 @@ The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiff
 
 ## How it works
 
-- **Scan:** calls `C_AuctionHouse.ReplicateItems()` and walks the result in small time slices so the game doesn't freeze, even on a very large auction house. For each listing with a buyout, it compares the buyout to `count × vendor sell price` from `C_Item.GetItemInfo`. Listings for items whose data isn't cached yet are retried for a few seconds.
+- **Scan:** sends an empty `C_AuctionHouse.SendBrowseQuery` and pages through the results with `RequestMoreBrowseResults`. This is the "summary" scan GoldScout uses on Forever. It returns every item with its lowest unit buyout, and unlike `ReplicateItems` it isn't limited to once every 15 minutes. Each item's lowest price is compared to its vendor sell price from `C_Item.GetItemInfo`, in small time slices so the game doesn't freeze. Items whose data isn't cached yet are retried for a few seconds.
 - **Verify:** before you can buy, a live `C_AuctionHouse.SendSearchQuery` fetches the item's current listings. Only listings that are still below vendor price, and aren't your own, become buyable. The list row updates to the live numbers.
 - **Buy:** `C_AuctionHouse.PlaceBid` for items. `StartCommoditiesPurchase` / `ConfirmCommoditiesPurchase` for commodities. After each purchase the item is searched again, so the next click always acts on fresh data.
 - **Profit tracking:** a purchase is counted only once the gold actually leaves your bags. The session total appears at the bottom of the window.
@@ -62,7 +62,9 @@ The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiff
 - **Not yet tested in the live game.** It was built against Blizzard's generated API documentation for the Forever client (build 1.60.1.71037) and tested against a mock of that API (see below). Report anything that behaves oddly.
 - **Settings may not persist on some Forever builds.** Some Forever builds write addon SavedVariables but don't load them at the next start. If that affects you, your min-profit setting and ignore list reset at login. Everything else works without saved data.
 - **Gear vendor prices** are read from the specific item link. If an item's real sell price differs from what the client reports, the profit shown can be off. Hover a row to see the item's actual tooltip sell price.
-- Blizzard's own Auction House window may also react to searches or commodity quotes that Vendor Diff makes.
+- Blizzard's own Auction House window may also react to searches or commodity quotes that Vendor Diff makes. For example, its Buy tab may show the scan's full item list.
+- **Sell tab:** while Blizzard's Sell tab is open, Vendor Diff holds its requests and won't buy. That tab throws an error if any Auction House request goes out while it's open. Switch to another tab and scanning carries on.
+- An item can look like a deal in the scan when its lowest price is a bid-only auction or your own listing. The live search catches these, and Vendor Diff skips them automatically.
 - Profit is vendor value minus buyout. It doesn't account for the trip to the mailbox and vendor.
 
 ## Development
@@ -82,5 +84,12 @@ Tests run the real addon files against a strict mock of the Forever client API (
 
 ```bash
 lua5.1 tests/run_tests.lua
+```
+
+```bash
 luacheck VendorDiff
 ```
+
+## Credits
+
+The summary-scan approach and the Sell tab workaround follow [GoldScout](https://wowgoldscout.com) by Alkhara (MIT License), which documents how they work on the Forever client. Vendor Diff contains no GoldScout code.

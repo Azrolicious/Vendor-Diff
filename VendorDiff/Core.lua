@@ -2,17 +2,13 @@
 local ADDON_NAME, ns = ...
 
 ns.ADDON_NAME = ADDON_NAME
-ns.VERSION = "0.1.0"
-
--- Full scans (getAll / ReplicateItems) are limited by the server to once per 15 minutes.
-ns.FULL_SCAN_COOLDOWN = 15 * 60
+ns.VERSION = "0.2.0"
 
 local DEFAULTS = {
   minProfit = 1,          -- copper; a listing must beat the vendor price by at least this much
   autoOpen = true,        -- open the window when the Auction House opens
   ignore = {},            -- [itemID] = true, never show these
   position = nil,         -- saved window position {point, relPoint, x, y}
-  lastFullScan = {},      -- [realm key] = time() of the last full scan we started
 }
 
 ---------------------------------------------------------------------------
@@ -177,17 +173,6 @@ end
 ---------------------------------------------------------------------------
 -- Misc helpers
 ---------------------------------------------------------------------------
-function ns.RealmKey()
-  return (GetRealmName and GetRealmName() or "?")
-end
-
-function ns.SecondsUntilFullScan()
-  local last = ns.db.lastFullScan[ns.RealmKey()]
-  if not last then return 0 end
-  local remaining = ns.FULL_SCAN_COOLDOWN - (time() - last)
-  return remaining > 0 and remaining or 0
-end
-
 function ns.QualityColor(quality)
   local c = ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[quality or 1]
   if c and c.hex then return c.hex end
@@ -216,15 +201,31 @@ ns.On("ADDON_LOADED", function(_, name)
   ns.Fire("DB_READY")
 end)
 
-ns.On("AUCTION_HOUSE_SHOW", function()
+local function AuctionHouseOpened()
+  if ns.ahOpen then return end -- both events below can report the same visit
   ns.ahOpen = true
   ns.Fire("AH_OPENED")
-end)
+end
 
-ns.On("AUCTION_HOUSE_CLOSED", function()
-  if not ns.ahOpen then return end -- this event can fire twice
+local function AuctionHouseClosed()
+  if not ns.ahOpen then return end
   ns.ahOpen = false
   ns.Fire("AH_CLOSED")
+end
+
+ns.On("AUCTION_HOUSE_SHOW", AuctionHouseOpened)
+ns.On("AUCTION_HOUSE_CLOSED", AuctionHouseClosed)
+
+-- The 12.x UI also reports the auctioneer through the interaction manager.
+local function IsAuctioneer(kind)
+  local types = Enum and Enum.PlayerInteractionType
+  return types ~= nil and types.Auctioneer ~= nil and kind == types.Auctioneer
+end
+ns.On("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", function(_, kind)
+  if IsAuctioneer(kind) then AuctionHouseOpened() end
+end)
+ns.On("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", function(_, kind)
+  if IsAuctioneer(kind) then AuctionHouseClosed() end
 end)
 
 ---------------------------------------------------------------------------

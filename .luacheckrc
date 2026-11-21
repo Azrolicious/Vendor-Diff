@@ -17,7 +17,7 @@ globals = {
 read_globals = {
   "AuctionHouseFrame", "C_AuctionHouse", "C_Item", "C_Timer", "CreateFrame",
   "DEFAULT_CHAT_FRAME", "Enum", "GameTooltip", "GameTooltip_Hide", "GetMoney",
-  "GetRealmName", "GetTime", "HandleModifiedItemClick", "ITEM_QUALITY_COLORS",
-  "IsControlKeyDown", "IsModifiedClick", "IsShiftKeyDown", "UIParent", "UnitName",
-  "debugprofilestop", "strjoin", "time", "tinsert", "tostringall", "wipe",
+  "GetTime", "HandleModifiedItemClick", "ITEM_QUALITY_COLORS",
+  "IsControlKeyDown", "IsModifiedClick", "UIParent", "UnitName",
+  "debugprofilestop", "strjoin", "tinsert", "tostringall", "wipe",
 }
