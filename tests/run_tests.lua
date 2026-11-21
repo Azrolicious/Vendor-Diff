@@ -28,7 +28,7 @@ local FILLER_BASE = 10000
 local function NewMarket(opts)
   opts = opts or {}
   local w = Mock.NewWorld(opts)
-  w:AddItem({ id = LINEN, name = "Linen Cloth", sellPrice = 13, classID = 7, stack = 200 })
+  w:AddItem({ id = LINEN, name = "Linen Cloth", sellPrice = 13, classID = 7, stack = 20 })
   w:AddItem({ id = SWORD, name = "Rusty Sword", sellPrice = 5000, classID = 2, ilvl = 30, quality = 2 })
   w:AddItem({ id = JUNK, name = "Unsellable Thing", sellPrice = 0 })
   w:AddItem({ id = SLOW, name = "Slow Loader", sellPrice = 1000, availableAt = w.now + 3 })
@@ -46,7 +46,8 @@ local function NewMarket(opts)
   w.itemAuctions[SWORD] = { { auctionID = 501, buyout = 3000, ilvl = 30 }, { auctionID = 502, buyout = 6000, ilvl = 30 } }
   w.itemAuctions[BIDONLY] = { { auctionID = 601, bid = 5, ilvl = 10 } }
 
-  for i = 1, (opts.fillers or 3000) do -- plenty of items that are not deals
+  w.fillerItem = FILLER_BASE + 1
+  for i = 1, math.max(1, opts.fillers or 3000) do -- plenty of items that are not deals
     local id = FILLER_BASE + i
     w:AddItem({ id = id, name = "Filler " .. i, sellPrice = 50 })
     w.commodities[id] = { { unitPrice = 100, quantity = 1 } }
@@ -524,6 +525,219 @@ test("saved settings merge with defaults (and missing SavedVariables are fine)",
   local w2 = NewMarket({ fillers = 10 })
   local ns2 = Boot(w2) -- Forever bug: SavedVariables may not load at all
   eq(ns2.db.minProfit, 1, "defaults when nothing was saved")
+end)
+
+---------------------------------------------------------------------------
+-- Selling what Vendor Diff bought
+---------------------------------------------------------------------------
+-- Pretend Vendor Diff bought `count` of an item (as SettlePurchase records it).
+local function Bought(w, ns, itemID, count, ilvl)
+  local sell = w.items[itemID].sellPrice
+  ns.Ledger:Add(itemID, w:ItemLink(itemID, ilvl), w.items[itemID].name, count, count * (sell - 2), count * sell)
+end
+
+local function LedgerCount(ns, key)
+  local e = ns.charDB.ledger[key]
+  return e and e.count or 0
+end
+
+test("purchases are recorded to be sold later", function()
+  local w = NewMarket({ fillers = 10 })
+  local ns = Boot(w)
+  ScanDone(w, ns)
+  w:Click(ns.UI.buyButton) -- Start: sword
+  w:Advance(1)
+  w:Click(ns.UI.buyButton) -- buy sword
+  w:Advance(2)
+  w:Click(ns.UI.buyButton) -- quote Slow Loader
+  w:Advance(1)
+  w:Click(ns.UI.buyButton) -- confirm
+  w:Advance(4)
+  eq(LedgerCount(ns, "100:30"), 1, "sword recorded with its item level")
+  eq(LedgerCount(ns, "300"), 2, "commodity recorded")
+  eq(ns.charDB.ledger["300"].cost, 500, "what we paid")
+  eq(ns.charDB.ledger["300"].vendor, 2000, "what the vendor pays")
+  ok(w:ChatContains("sold at the next vendor"), "tells the player what happens next")
+end)
+
+test("a vendor gets exactly the bought amount, splitting a mixed stack", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 18)
+  w:PutInBags(LINEN, 5)        -- 5 of your own...
+  w:CollectMail(LINEN, 18)     -- ...topped up to 20 by the mail, plus a stack of 3
+  eq(w.bags[0].slots[1].count, 20, "mixed stack of 20")
+  local money = w.money
+  w:OpenMerchant()
+  w:Advance(5)
+  eq(w:BagCount(LINEN), 5, "your own 5 are kept")
+  eq(w.money, money + 18 * 13, "sold 18 at the vendor price")
+  eq(count(w.calls.SplitContainerItem), 1, "one stack had to be split")
+  eq(ns.charDB.ledger["2589"], nil, "record cleared once sold")
+  ok(w:ChatContains("Sold 18x"), "sale reported")
+  eq(w.usedOutsideMerchant + w.attachedToMail, 0, "nothing used or mailed by mistake")
+  eq(w.cursor, nil, "nothing left on the cursor")
+end)
+
+test("items you get later are never sold", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 4)
+  w:CollectMail(LINEN, 4)
+  w:OpenMerchant()
+  w:Advance(3)
+  w:CloseMerchant()
+  eq(w:BagCount(LINEN), 0, "bought ones sold")
+  w:PutInBags(LINEN, 10) -- farmed later
+  local sales = count(w.calls.UseContainerItem)
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(count(w.calls.UseContainerItem), sales, "nothing sold on the second visit")
+  eq(w:BagCount(LINEN), 10, "farmed cloth kept")
+end)
+
+test("your own copies aren't sold while the bought ones are still in the mailbox", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 5)
+  w:PutInBags(LINEN, 5) -- your own, farmed
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(count(w.calls.UseContainerItem), 0, "your own linen isn't sold in their place")
+  eq(LedgerCount(ns, "2589"), 5, "still tracked")
+  w:CloseMerchant()
+  w:CollectMail(LINEN, 5)
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 5, "exactly the 5 bought were sold")
+  eq(LedgerCount(ns, "2589"), 0, "record cleared")
+end)
+
+test("only what was actually collected from the mailbox counts", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 18)
+  w:OpenMail()
+  w:TakeMail(LINEN, 6)  -- took one letter
+  w:CloseMail()
+  w:PutInBags(LINEN, 4) -- looted later, not from the mail
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 4, "sold the 6 collected, kept the 4 looted")
+  eq(LedgerCount(ns, "2589"), 12, "12 still waiting in the mailbox")
+  eq(ns.charDB.ledger["2589"].arrived, 0, "none of those collected yet")
+end)
+
+test("never sells while the mailbox, bank or Auction House is open", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 5)
+  w:OpenMail()
+  w:TakeMail(LINEN, 5)
+  w:OpenMerchant() -- mailbox still open
+  w:Advance(3)
+  eq(count(w.calls.UseContainerItem), 0, "no sale with the mailbox open")
+  eq(w.attachedToMail, 0, "nothing attached to mail")
+  eq(LedgerCount(ns, "2589"), 5, "still tracked")
+  w:CloseMail()
+  w:CloseMerchant()
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 0, "sold once only the vendor is open")
+end)
+
+test("gear is matched by item level", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, SWORD, 1, 30)
+  w:PutInBags(SWORD, 1, 25) -- your own, lower item level
+  w:CollectMail(SWORD, 1, 30) -- the one Vendor Diff bought
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(SWORD, 30), 0, "bought sword sold")
+  eq(w:BagCount(SWORD, 25), 1, "your own sword kept")
+end)
+
+test("if the game blocks auto-selling, a Sell button takes over", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  w.sellNeedsClick = true
+  Bought(w, ns, LINEN, 5)
+  w:CollectMail(LINEN, 5)
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 5, "nothing sold")
+  eq(LedgerCount(ns, "2589"), 5, "record kept when the sale was blocked")
+  ok(w:ChatContains("blocked automatic selling"), "explains")
+  local button = w.env.VendorDiffSellButton
+  ok(button and button:IsShown(), "button shown")
+  eq(button:GetText(), "Sell Vendor Diff items (5)", "with the count")
+  w:Click(button)
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 0, "sold with a click")
+  eq(LedgerCount(ns, "2589"), 0, "record cleared")
+  ok(not button:IsShown(), "button hidden when nothing is left")
+end)
+
+test("with auto-sell off, the Sell button and /vd sell do it", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  w.env.SlashCmdList.VENDORDIFF("autosell")
+  eq(ns.db.autoSell, false, "auto-sell off")
+  Bought(w, ns, LINEN, 3)
+  w:CollectMail(LINEN, 3)
+  w:OpenMerchant()
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 3, "not sold automatically")
+  ok(w.env.VendorDiffSellButton:IsShown(), "button offered")
+  w.env.SlashCmdList.VENDORDIFF("sell")
+  w:Advance(3)
+  eq(w:BagCount(LINEN), 0, "/vd sell sold them")
+end)
+
+test("a mixed stack with no free bag slot is left alone and reported", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  Bought(w, ns, LINEN, 18)
+  w:PutInBags(LINEN, 2)    -- 2 of your own
+  w:CollectMail(LINEN, 18) -- stacks onto them: one stack of 20
+  w:FillBags()
+  w:OpenMerchant()
+  w:Advance(5)
+  eq(w:BagCount(LINEN), 20, "your 2 were not sold along with them")
+  eq(LedgerCount(ns, "2589"), 18, "still tracked")
+  ok(w:ChatContains("needs a free bag slot"), "explains how to fix it")
+end)
+
+test("/vd pending lists records and /vd forget drops them", function()
+  local w = NewMarket({ fillers = 1 })
+  local ns = Boot(w)
+  local slash = w.env.SlashCmdList.VENDORDIFF
+  slash("pending")
+  ok(w:ChatContains("Nothing bought through Vendor Diff"), "empty list")
+  Bought(w, ns, LINEN, 18)
+  Bought(w, ns, SLOW, 2)
+  w:CollectMail(LINEN, 6)
+  slash("pending")
+  ok(w:ChatContains("18x .*Linen Cloth.*%(6 ready to sell, 12 still in the mailbox%)"),
+    "lists linen with what's collected and what's still in the mail")
+  slash("forget 2589")
+  eq(ns.charDB.ledger["2589"], nil, "linen forgotten")
+  eq(LedgerCount(ns, "300"), 2, "others kept")
+  slash("forget all")
+  eq(next(ns.charDB.ledger), nil, "all forgotten")
+end)
+
+test("records older than 30 days are dropped", function()
+  local w = NewMarket({ fillers = 1 })
+  w.env.VendorDiffCharDB = { ledger = {
+    ["2589"] = { itemID = LINEN, name = "Linen Cloth", count = 5, cost = 50, vendor = 65, boughtAt = 1000 - 31 * 86400 },
+    ["300"] = { itemID = SLOW, name = "Slow Loader", count = 1, cost = 250, vendor = 1000, boughtAt = 1000 - 86400 },
+  } }
+  local ns = Boot(w)
+  eq(ns.charDB.ledger["2589"], nil, "old record dropped")
+  eq(LedgerCount(ns, "300"), 1, "recent record kept")
+  ok(w:ChatContains("Stopped tracking 5x"), "says so")
 end)
 
 ---------------------------------------------------------------------------

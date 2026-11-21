@@ -79,8 +79,11 @@ function Buyer:SettlePurchase()
   s.purchases = s.purchases + 1
   s.spent = s.spent + spent
   s.value = s.value + p.vendor
-  ns.Print(("Bought %s for %s (vendors for %s, profit %s)."):format(
-    what, ns.FormatMoney(spent), ns.FormatMoney(p.vendor), ns.FormatMoney(p.vendor - spent)))
+  ns.Ledger:Add(p.cand.itemID, p.link or p.cand.link, p.cand.name, p.quantity, spent, p.vendor)
+  ns.Print(("Bought %s for %s (vendors for %s, profit %s). %s"):format(
+    what, ns.FormatMoney(spent), ns.FormatMoney(p.vendor), ns.FormatMoney(p.vendor - spent),
+    ns.db.autoSell and "It will be sold at the next vendor once it's in your bags."
+      or "Use the Sell button at a vendor (or /vd sell) once it's in your bags."))
   return nil
 end
 

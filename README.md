@@ -20,7 +20,7 @@ The TOC targets interface `16001` (Forever client 1.60.1). If the AddOns list ma
    - **Gear and other non-stacking items** are bought one auction per click.
    - **Commodities** (stackable goods like cloth and herbs) take two clicks. **Buy** asks the server for the exact total price of every unit below vendor price. **Confirm** buys them. If the price has risen above vendor value by then, the purchase is cancelled.
 5. When an item is used up, Vendor Diff moves to the next one and searches it automatically. Items that sold out since the scan are skipped.
-6. Collect your purchases from the mailbox and sell them to a vendor.
+6. Collect your purchases from the mailbox, then open any vendor. Vendor Diff sells exactly what it bought for you (see below).
 
 Every purchase needs a click: Blizzard only allows buying from the Auction House in response to a key press or mouse click. Vendor Diff never buys on its own.
 
@@ -49,9 +49,30 @@ Every purchase needs a click: Blizzard only allows buying from the Auction House
 /vd buymode blizzard    buy through Blizzard's own "Buyout this item?" dialog (click Accept there)
 /vd buymode direct      Vendor Diff places the bid itself (default)
 /vd reset               reset the window position
+/vd pending             list bought items waiting to be sold to a vendor
+/vd sell                sell them now (with a vendor open)
+/vd autosell            toggle selling them automatically when a vendor opens
+/vd forget <link|id|all>  stop tracking items so they're never auto-sold
 ```
 
 The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiffBuyButton` macro bound to a key may work as well. This hasn't been tested on Forever.
+
+## Selling what you bought
+
+Every purchase Vendor Diff makes is remembered per character: the item, how many, what you paid, and what the vendor pays.
+
+- **When items count as arrived:** Auction House purchases are delivered by mail. While your mailbox is open, Vendor Diff watches how many of each bought item enter your bags, and only those count as arrived.
+- **What gets sold:** when you open a vendor, it sells exactly the arrived amount. If the bought items stacked onto ones you already had, it splits off the right number into an empty bag slot and sells those, so yours stay.
+- **No repeats:** once the bought amount is sold, the record is gone. Copies you farm, craft or loot later are never sold.
+- **Copies you already have:** these are never sold in place of bought ones that are still in the mailbox.
+- **Safety:** it only sells while a vendor is open and the mailbox, bank, trade and Auction House windows are closed. With those open, the same game action would attach, deposit or use the item instead.
+- **Chat summary:** each sale is listed with what you paid and the profit.
+- **If something goes wrong:**
+  - If the game blocks automatic selling, or you turn it off with `/vd autosell`, a **Sell Vendor Diff items** button appears under the vendor window.
+  - If a mixed stack can't be split because your bags are full, Vendor Diff tells you and leaves the stack alone.
+- **Expiry:** records older than 30 days are dropped, matching how long the mail keeps items.
+
+The records are saved per character (`VendorDiffCharDB`). Some Forever builds have a bug where saved data isn't loaded at the next login. If that happens, the records are lost and nothing gets auto-sold, which errs on the side of keeping your items. Check with `/vd pending` after a `/reload`.
 
 ## How it works
 
@@ -84,6 +105,7 @@ The addon is plain Lua 5.1 with no libraries:
 | `VendorDiff/Scan.lua` | Time-sliced full-scan processing with retries for uncached items |
 | `VendorDiff/Backend_Modern.lua` | `C_AuctionHouse` scan, live search, and purchase calls |
 | `VendorDiff/Buyer.lua` | The select, search, buy, confirm, next state machine |
+| `VendorDiff/Ledger.lua` | Records purchases, notices them arriving from the mail, and sells them at vendors |
 | `VendorDiff/UI.lua` | The window |
 
 Tests run the real addon files against a strict mock of the Forever client API (`tests/wowmock.lua`). The mock simulates the Auction House, slow-loading item data, the query throttle, and timers. It errors on unknown widget methods, unknown events, and any purchase call made outside a simulated click:

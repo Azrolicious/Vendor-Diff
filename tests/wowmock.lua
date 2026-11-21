@@ -169,6 +169,7 @@ local MODERN_EVENTS = {
   "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED", "AUCTION_HOUSE_BROWSE_FAILURE",
   "PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
   "ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN", "PLAYER_MONEY", "ADDON_RESTRICTION_STATE_CHANGED",
+  "MERCHANT_SHOW", "MERCHANT_CLOSED", "BAG_UPDATE_DELAYED", "ITEM_LOCK_CHANGED", "MAIL_SHOW", "MAIL_CLOSED",
   "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT",
   "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED",
   "AUCTION_HOUSE_SHOW_NOTIFICATION", "AUCTION_HOUSE_SHOW_FORMATTED_NOTIFICATION",
@@ -439,7 +440,7 @@ function World:BuildEnv()
   env.Enum = {
     AuctionHouseSortOrder = { Price = 0 },
     ItemClass = { Weapon = 2, Armor = 4 },
-    PlayerInteractionType = { Auctioneer = 21 },
+    PlayerInteractionType = { Auctioneer = 21, Merchant = 7 },
     AddOnRestrictionType = { Combat = 0, Encounter = 1 },
   }
   env.ITEM_QUALITY_COLORS = {}
@@ -477,6 +478,7 @@ function World:BuildEnv()
   }
 
   self:BuildModernAH()
+  self:BuildBagsAndVendor()
 end
 
 ---------------------------------------------------------------------------
@@ -502,6 +504,7 @@ function World:BuildModernAH()
   rawset(ah, "CommoditiesSellFrame", Widget.new(world, "Frame", nil, ah))
   ah.ItemSellFrame:Hide()
   ah.CommoditiesSellFrame:Hide()
+  ah:Hide() -- shown by OpenAH
   rawset(env, "AuctionHouseFrame", ah)
 
   local function sentRequest()
@@ -727,6 +730,194 @@ function World:BuildModernAH()
 end
 
 ---------------------------------------------------------------------------
+-- Bags, cursor and vendor
+---------------------------------------------------------------------------
+-- world.bags[bag] = { size = n, family = 0, slots = { [slot] = { itemID, count, ilvl, locked } } }
+function World:BuildBagsAndVendor()
+  local world, env = self, self.env
+  world.bags = {
+    [0] = { size = 16, family = 0, slots = {} },
+    [1] = { size = 8, family = 0, slots = {} },
+  }
+  world.cursor = nil
+  world.merchantOpen = false
+  world.sellNeedsClick = false   -- true: selling is a restricted action
+  world.usedOutsideMerchant = 0  -- items "used" because no vendor was open (must stay 0)
+  world.attachedToMail = 0       -- items attached to mail by mistake (must stay 0)
+  env.NUM_BAG_SLOTS = 4
+  for _, name in ipairs({ "MerchantFrame", "MailFrame", "BankFrame", "TradeFrame" }) do
+    local f = Widget.new(world, "Frame", name)
+    f:Hide()
+    rawset(env, name, f)
+  end
+
+  local function slotItem(bag, slot)
+    local b = world.bags[bag]
+    return b and b.slots[slot]
+  end
+
+  local C = {}
+  env.C_Container = C
+  function C.GetContainerNumSlots(bag) return world.bags[bag] and world.bags[bag].size or 0 end
+  function C.GetContainerNumFreeSlots(bag)
+    local b = world.bags[bag]
+    if not b then return 0, 0 end
+    local free = 0
+    for slot = 1, b.size do if not b.slots[slot] then free = free + 1 end end
+    return free, b.family
+  end
+  function C.GetContainerItemInfo(bag, slot)
+    local it = slotItem(bag, slot)
+    if not it then return nil end
+    local d = world.items[it.itemID]
+    return {
+      itemID = it.itemID, stackCount = it.count, isLocked = it.locked or false,
+      hyperlink = world:ItemLink(it.itemID, it.ilvl), hasNoValue = (d.sellPrice or 0) == 0,
+      quality = d.quality, iconFileID = d.texture, itemName = d.name,
+    }
+  end
+  function C.UseContainerItem(bag, slot)
+    if world.sellNeedsClick and not world:RequireHardware("UseContainerItem") then return end
+    local it = slotItem(bag, slot)
+    if not it or it.locked then return end
+    world:Call("UseContainerItem", bag, slot, it.itemID, it.count)
+    local blockingOpen = env.MailFrame:IsShown() or env.BankFrame:IsShown() or env.TradeFrame:IsShown()
+      or (env.AuctionHouseFrame and env.AuctionHouseFrame:IsShown())
+    if env.MailFrame:IsShown() then
+      world.attachedToMail = world.attachedToMail + it.count
+    elseif world.merchantOpen and not blockingOpen then
+      world.money = world.money + world.items[it.itemID].sellPrice * it.count
+      world.bags[bag].slots[slot] = nil
+      world:FireLater(0.1, "BAG_UPDATE_DELAYED")
+      world:FireLater(0.1, "PLAYER_MONEY")
+    else
+      world.usedOutsideMerchant = world.usedOutsideMerchant + it.count
+    end
+  end
+  function C.SplitContainerItem(bag, slot, amount)
+    local it = slotItem(bag, slot)
+    assert(it and not world.cursor and amount < it.count, "bad split")
+    world:Call("SplitContainerItem", bag, slot, amount)
+    it.count = it.count - amount
+    world.cursor = { itemID = it.itemID, count = amount, ilvl = it.ilvl, from = it }
+  end
+  function C.PickupContainerItem(bag, slot)
+    local c = world.cursor
+    if not c then return end
+    local b = world.bags[bag]
+    if b and not b.slots[slot] and (b.family == 0) then
+      local placed = { itemID = c.itemID, count = c.count, ilvl = c.ilvl, locked = true }
+      b.slots[slot] = placed
+      world.cursor = nil
+      world:AddTimer(0.3, function() placed.locked = false end)
+    end
+  end
+  env.CursorHasItem = function() return world.cursor ~= nil end
+  env.ClearCursor = function()
+    local c = world.cursor
+    if c then c.from.count = c.from.count + c.count end
+    world.cursor = nil
+  end
+end
+
+function World:PutInBags(itemID, count, ilvl, bagFilter)
+  for bag = 0, 4 do
+    local b = self.bags[bag]
+    if b and (not bagFilter or bag == bagFilter) then
+      for slot = 1, b.size do
+        if not b.slots[slot] then
+          b.slots[slot] = { itemID = itemID, count = count, ilvl = ilvl }
+          return bag, slot
+        end
+      end
+    end
+  end
+  error("bags full")
+end
+
+function World:BagCount(itemID, ilvl)
+  local n = 0
+  for bag = 0, 4 do
+    local b = self.bags[bag]
+    if b then
+      for slot = 1, b.size do
+        local it = b.slots[slot]
+        if it and it.itemID == itemID and (not ilvl or it.ilvl == ilvl) then n = n + it.count end
+      end
+    end
+  end
+  return n
+end
+
+function World:FillBags()
+  for bag = 0, 4 do
+    local b = self.bags[bag]
+    if b then
+      for slot = 1, b.size do
+        if not b.slots[slot] then b.slots[slot] = { itemID = self.fillerItem, count = 1 } end
+      end
+    end
+  end
+end
+
+-- Take an item from the mailbox: fills existing stacks first, like the game.
+function World:TakeMail(itemID, count, ilvl)
+  local stackSize = self.items[itemID].stack or 1
+  for bag = 0, 4 do
+    local b = self.bags[bag]
+    if b then
+      for slot = 1, b.size do
+        local it = b.slots[slot]
+        if count > 0 and it and it.itemID == itemID and it.ilvl == ilvl and it.count < stackSize then
+          local add = math.min(count, stackSize - it.count)
+          it.count, count = it.count + add, count - add
+        end
+      end
+    end
+  end
+  while count > 0 do
+    local add = math.min(count, stackSize)
+    self:PutInBags(itemID, add, ilvl)
+    count = count - add
+  end
+  self:FireLater(0.1, "BAG_UPDATE_DELAYED")
+  self:Advance(0.2)
+end
+
+function World:OpenMail()
+  self.env.MailFrame:Show()
+  self:Fire("MAIL_SHOW")
+  self:Advance(0.05)
+end
+
+function World:CloseMail()
+  self.env.MailFrame:Hide()
+  self:Fire("MAIL_CLOSED")
+  self:Advance(0.05)
+end
+
+-- Collect Vendor Diff's purchases from the mailbox.
+function World:CollectMail(itemID, count, ilvl)
+  self:OpenMail()
+  self:TakeMail(itemID, count, ilvl)
+  self:CloseMail()
+end
+
+function World:OpenMerchant()
+  self.merchantOpen = true
+  self.env.MerchantFrame:Show()
+  self:Fire("MERCHANT_SHOW")
+  self:Advance(0.05)
+end
+
+function World:CloseMerchant()
+  self.merchantOpen = false
+  self.env.MerchantFrame:Hide()
+  self:Fire("MERCHANT_CLOSED")
+  self:Advance(0.05)
+end
+
+---------------------------------------------------------------------------
 -- Loading the addon
 ---------------------------------------------------------------------------
 function World:LoadAddon()
@@ -748,11 +939,13 @@ function World:LoadAddon()
 end
 
 function World:OpenAH()
+  self.env.AuctionHouseFrame:Show()
   self:Fire("AUCTION_HOUSE_SHOW")
   self:Advance(0.05)
 end
 
 function World:CloseAH()
+  self.env.AuctionHouseFrame:Hide()
   self:Fire("AUCTION_HOUSE_CLOSED")
   self:Advance(0.05)
 end

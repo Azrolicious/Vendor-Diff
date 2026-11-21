@@ -2,7 +2,7 @@
 local ADDON_NAME, ns = ...
 
 ns.ADDON_NAME = ADDON_NAME
-ns.VERSION = "0.2.2"
+ns.VERSION = "0.3.0"
 
 local DEFAULTS = {
   minProfit = 1,          -- copper; a listing must beat the vendor price by at least this much
@@ -11,6 +11,7 @@ local DEFAULTS = {
   position = nil,         -- saved window position {point, relPoint, x, y}
   debug = false,          -- print Auction House traffic during purchases
   buyMode = "direct",     -- "direct": Vendor Diff places the bid; "blizzard": via Blizzard's buyout dialog
+  autoSell = true,        -- sell what Vendor Diff bought when a vendor window opens
 }
 
 ---------------------------------------------------------------------------
@@ -200,6 +201,11 @@ ns.On("ADDON_LOADED", function(_, name)
     end
   end
   ns.db = VendorDiffDB
+  -- Per character: what this character bought through Vendor Diff and
+  -- hasn't sold yet (see Ledger.lua).
+  VendorDiffCharDB = VendorDiffCharDB or {}
+  VendorDiffCharDB.ledger = VendorDiffCharDB.ledger or {}
+  ns.charDB = VendorDiffCharDB
   ns.Fire("DB_READY")
 end)
 
@@ -249,6 +255,10 @@ local HELP = {
   "/vd debug - toggle printing what the Auction House reports during searches and purchases",
   "/vd buymode direct|blizzard - buy directly, or through Blizzard's own buyout dialog (current: %s)",
   "/vd reset - reset the window position",
+  "/vd pending - list what Vendor Diff bought that hasn't been sold to a vendor yet",
+  "/vd sell - sell those items now (at an open vendor)",
+  "/vd autosell - toggle selling them automatically when a vendor opens",
+  "/vd forget <item link or ID|all> - stop tracking items so they're never auto-sold",
 }
 
 SLASH_VENDORDIFF1 = "/vendordiff"
@@ -297,6 +307,26 @@ SlashCmdList.VENDORDIFF = function(input)
     ns.Print(mode == "blizzard"
       and "Buy mode: Blizzard. Buy opens Blizzard's buyout dialog; click Accept there to buy."
       or "Buy mode: direct. Vendor Diff places the bid itself.")
+  elseif cmd == "pending" then
+    ns.Ledger:PrintPending()
+  elseif cmd == "sell" then
+    ns.Ledger:SellPending("command")
+  elseif cmd == "autosell" then
+    ns.db.autoSell = not ns.db.autoSell
+    ns.Print("Auto-sell at vendors: " .. (ns.db.autoSell and "on" or "off")
+      .. (ns.db.autoSell and "" or ". Use the Sell button under the vendor window, or /vd sell."))
+    ns.Fire("LEDGER_CHANGED")
+  elseif cmd == "forget" then
+    if rest:lower() == "all" then
+      ns.Ledger:Clear()
+      ns.Print("No longer tracking any bought items.")
+      return
+    end
+    local id = ItemIDFromArg(rest)
+    if not id then ns.Print("Usage: /vd forget <item link or ID|all>") return end
+    local n = ns.Ledger:ForgetItem(id)
+    ns.Print(n > 0 and ("No longer tracking item " .. id .. "; it won't be auto-sold.")
+      or ("Item " .. id .. " isn't being tracked."))
   elseif cmd == "debug" then
     ns.db.debug = not ns.db.debug
     ns.Print("Debug output: " .. (ns.db.debug and "on" or "off"))

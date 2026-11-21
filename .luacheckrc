@@ -7,6 +7,7 @@ exclude_files = { "tests/**" }
 -- Globals the addon defines.
 globals = {
   "VendorDiffDB",
+  "VendorDiffCharDB",
   "SLASH_VENDORDIFF1",
   "SLASH_VENDORDIFF2",
   "SlashCmdList",
@@ -19,7 +20,8 @@ read_globals = {
   "DEFAULT_CHAT_FRAME", "Enum", "GameTooltip", "GameTooltip_Hide", "GetMoney",
   "GetTime", "HandleModifiedItemClick", "ITEM_QUALITY_COLORS",
   "IsControlKeyDown", "IsModifiedClick", "UIParent", "UnitName",
-  "debugprofilestop", "strjoin", "tinsert",
+  "debugprofilestop", "strjoin", "time", "tinsert",
   "StaticPopupDialogs", "StaticPopup_Show", "StaticPopup_Visible", "StaticPopup_Hide",
-  "C_RestrictedActions", "InCombatLockdown", "tostringall", "wipe",
+  "C_RestrictedActions", "InCombatLockdown",
+  "C_Container", "CursorHasItem", "ClearCursor", "tostringall", "wipe",
 }

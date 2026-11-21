@@ -1,9 +1,10 @@
 ## Interface: 16001
 ## Title: Vendor Diff
-## Notes: WoW Forever: scans the Auction House for listings whose buyout is below the vendor sell price, and lets you buy them for guaranteed profit.
+## Notes: WoW Forever: finds Auction House listings below vendor price, buys them, and sells them to the next vendor you visit.
 ## Author: Azrolicious
-## Version: 0.2.2
+## Version: 0.3.0
 ## SavedVariables: VendorDiffDB
+## SavedVariablesPerCharacter: VendorDiffCharDB
 ## IconTexture: Interface\Icons\INV_Misc_Coin_01
 
 Core.lua
@@ -11,4 +12,5 @@ Results.lua
 Scan.lua
 Backend_Modern.lua
 Buyer.lua
+Ledger.lua
 UI.lua

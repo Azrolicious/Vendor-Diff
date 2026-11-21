@@ -487,12 +487,15 @@ function UI:RefreshBuyer()
   self.buyStatus:SetText(ns.Buyer.message or "")
 
   local s = ns.Buyer.session
+  local parts = {}
   if s.purchases > 0 then
-    self.sessionText:SetText(("Session: %d purchases, spent %s, vendor value %s, |cff33ff33profit %s|r"):format(
-      s.purchases, ns.FormatMoney(s.spent), ns.FormatMoney(s.value), ns.FormatMoney(s.value - s.spent)))
-  else
-    self.sessionText:SetText("")
+    parts[#parts + 1] = ("Session: %d purchases, spent %s, |cff33ff33profit %s|r"):format(
+      s.purchases, ns.FormatMoney(s.spent), ns.FormatMoney(s.value - s.spent))
   end
+  if (s.soldUnits or 0) > 0 then
+    parts[#parts + 1] = ("sold %d to vendors for %s"):format(s.soldUnits, ns.FormatMoney(s.soldFor))
+  end
+  self.sessionText:SetText(table.concat(parts, "; "))
 end
 
 function UI:Refresh()
