@@ -65,7 +65,7 @@ The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiff
 
 - **Purchase calls must be direct.** The Forever client blocks `C_AuctionHouse.PlaceBid` with `ADDON_ACTION_BLOCKED` when an addon calls it through `pcall`. Called directly from the click, as Vendor Diff does, it goes through (confirmed in game). If purchases are ever blocked anyway, `/vd buymode blizzard` is a fallback. Buy then opens Blizzard's own buyout confirmation, and Blizzard's code places the bid when you click **Accept**. If Blizzard's own Buyout button misbehaves after using that mode, `/reload` resets it.
 
-- **Not yet tested in the live game.** It was built against Blizzard's generated API documentation for the Forever client (build 1.60.1.71037) and tested against a mock of that API (see below). Report anything that behaves oddly.
+- **Tested in game on Forever:** scanning, single-item buyouts, and commodity purchases (quote, then confirm) all work. The test suite runs against a mock of the Forever API (see below), so new changes are checked there before they reach the game.
 - **Settings may not persist on some Forever builds.** Some Forever builds write addon SavedVariables but don't load them at the next start. If that affects you, your min-profit setting and ignore list reset at login. Everything else works without saved data.
 - **Gear vendor prices** are read from the specific item link. If an item's real sell price differs from what the client reports, the profit shown can be off. Hover a row to see the item's actual tooltip sell price.
 - Blizzard's own Auction House window may also react to searches or commodity quotes that Vendor Diff makes. For example, its Buy tab may show the scan's full item list.
