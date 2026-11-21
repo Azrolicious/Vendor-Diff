@@ -467,9 +467,10 @@ for _, event in ipairs({
 end
 
 -- Restricted functions are called directly, never through pcall: on
--- Forever a pcall-wrapped restricted call is reported as UNKNOWN() and may
--- be what gets it blocked. Arguments are checked first instead, so a bad
--- value is reported rather than raising a Lua error.
+-- Forever a pcall-wrapped PlaceBid is blocked (ADDON_ACTION_BLOCKED, reported
+-- as UNKNOWN()), while the same call made directly from the click works
+-- (confirmed in game). Arguments are checked first instead, so a bad value
+-- is reported rather than raising a Lua error.
 local function ValidAmount(n)
   return type(n) == "number" and n > 0 and n == math.floor(n)
 end

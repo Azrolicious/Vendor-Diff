@@ -63,7 +63,7 @@ The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiff
 
 ## Caveats
 
-- **Forever may block addon purchases.** On some clicks the Forever client refuses `C_AuctionHouse.PlaceBid` when an addon calls it, firing `ADDON_ACTION_BLOCKED`. Others have seen the same, while some addon purchases go through. If yours are blocked, try `/vd buymode blizzard`: Buy then opens Blizzard's own buyout confirmation, and Blizzard's code places the bid when you click **Accept**. If Blizzard's own Buyout button misbehaves after using that mode, `/reload` resets it.
+- **Purchase calls must be direct.** The Forever client blocks `C_AuctionHouse.PlaceBid` with `ADDON_ACTION_BLOCKED` when an addon calls it through `pcall`. Called directly from the click, as Vendor Diff does, it goes through (confirmed in game). If purchases are ever blocked anyway, `/vd buymode blizzard` is a fallback. Buy then opens Blizzard's own buyout confirmation, and Blizzard's code places the bid when you click **Accept**. If Blizzard's own Buyout button misbehaves after using that mode, `/reload` resets it.
 
 - **Not yet tested in the live game.** It was built against Blizzard's generated API documentation for the Forever client (build 1.60.1.71037) and tested against a mock of that API (see below). Report anything that behaves oddly.
 - **Settings may not persist on some Forever builds.** Some Forever builds write addon SavedVariables but don't load them at the next start. If that affects you, your min-profit setting and ignore list reset at login. Everything else works without saved data.
