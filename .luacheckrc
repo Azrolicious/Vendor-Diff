@@ -19,5 +19,7 @@ read_globals = {
   "DEFAULT_CHAT_FRAME", "Enum", "GameTooltip", "GameTooltip_Hide", "GetMoney",
   "GetTime", "HandleModifiedItemClick", "ITEM_QUALITY_COLORS",
   "IsControlKeyDown", "IsModifiedClick", "UIParent", "UnitName",
-  "debugprofilestop", "strjoin", "tinsert", "tostringall", "wipe",
+  "debugprofilestop", "strjoin", "tinsert",
+  "StaticPopupDialogs", "StaticPopup_Show", "StaticPopup_Visible", "StaticPopup_Hide",
+  "C_RestrictedActions", "InCombatLockdown", "tostringall", "wipe",
 }

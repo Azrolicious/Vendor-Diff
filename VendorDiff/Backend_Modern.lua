@@ -223,11 +223,14 @@ function M:CancelAll()
   self.search = nil
   if self.summary and self.summary.timer then self.summary.timer:Cancel() end
   self.summary = nil
-  if self.purchase then
-    if self.purchase.timer then self.purchase.timer:Cancel() end
-    if self.purchase.kind == "commodity" and C_AuctionHouse.CancelCommoditiesPurchase then
+  local p = self.purchase
+  if p then
+    if p.timer then p.timer:Cancel() end
+    if p.ticker then p.ticker:Cancel() end
+    if p.kind == "commodity" and C_AuctionHouse.CancelCommoditiesPurchase then
       C_AuctionHouse.CancelCommoditiesPurchase()
     end
+    if p.viaBlizzard and StaticPopup_Hide then StaticPopup_Hide("BUYOUT_AUCTION") end
   end
   self.purchase = nil
   queued = nil
@@ -405,9 +408,25 @@ local function Trace(fmt, ...)
 end
 M.Trace = Trace
 
+-- Which 12.x addon restrictions are active right now (combat, encounter...).
+local function RestrictionSummary()
+  local parts = {}
+  if InCombatLockdown and InCombatLockdown() then parts[#parts + 1] = "in combat" end
+  local types = Enum and Enum.AddOnRestrictionType
+  local api = C_RestrictedActions and C_RestrictedActions.IsAddOnRestrictionActive
+  if types and api then
+    for name, value in pairs(types) do
+      local ok, active = pcall(api, value)
+      if ok and active then parts[#parts + 1] = name end
+    end
+  end
+  return #parts > 0 and table.concat(parts, ", ") or "none"
+end
+
 function M:BeginTrace(what)
   trace = {}
-  Trace("%s; Auction House ready: %s", what, tostring(C_AuctionHouse.IsThrottledMessageSystemReady()))
+  Trace("%s; Auction House ready: %s; addon restrictions active: %s",
+    what, tostring(C_AuctionHouse.IsThrottledMessageSystemReady()), RestrictionSummary())
 end
 
 -- Stop recording and return what was seen since BeginTrace.
@@ -442,16 +461,17 @@ for _, event in ipairs({
   "AUCTION_HOUSE_SHOW_ERROR", "AUCTION_HOUSE_SHOW_NOTIFICATION", "AUCTION_HOUSE_SHOW_FORMATTED_NOTIFICATION",
   "AUCTION_HOUSE_PURCHASE_COMPLETED", "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE",
   "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED", "UI_ERROR_MESSAGE", "PLAYER_MONEY",
+  "ADDON_RESTRICTION_STATE_CHANGED",
 }) do
   ns.On(event, TraceEvent)
 end
 
--- Call a purchase API, catching Lua errors so they're reported instead of
--- disappearing (the game hides Lua errors unless scriptErrors is on).
-local function Call(name, fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then Trace("%s raised a Lua error: %s", name, tostring(err)) end
-  return ok, err
+-- Restricted functions are called directly, never through pcall: on
+-- Forever a pcall-wrapped restricted call is reported as UNKNOWN() and may
+-- be what gets it blocked. Arguments are checked first instead, so a bad
+-- value is reported rather than raising a Lua error.
+local function ValidAmount(n)
+  return type(n) == "number" and n > 0 and n == math.floor(n)
 end
 
 ---------------------------------------------------------------------------
@@ -463,6 +483,7 @@ end
 function M:FinishPurchase(p, ok, err)
   if self.purchase ~= p then return end
   if p.timer then p.timer:Cancel() end
+  if p.ticker then p.ticker:Cancel() end
   self.purchase = nil
   p.onDone(ok, err)
 end
@@ -475,11 +496,41 @@ local function NewPurchase(p, timeout, timeoutOk, timeoutErr)
 end
 
 function M:Buy(offer, onDone)
-  self:BeginTrace(("PlaceBid(auction %s, %s)"):format(tostring(offer.auctionID), ns.FormatMoneyPlain(offer.cost)))
-  local p = NewPurchase({ kind = "item", auctionID = offer.auctionID, onDone = onDone },
+  if not (ValidAmount(offer.auctionID) and ValidAmount(offer.cost)) then
+    onDone(false, ("bad listing data (auction %s, price %s)."):format(tostring(offer.auctionID), tostring(offer.cost)))
+    return
+  end
+  self:BeginTrace(("PlaceBid(auction %d, %s)"):format(offer.auctionID, ns.FormatMoneyPlain(offer.cost)))
+  NewPurchase({ kind = "item", auctionID = offer.auctionID, onDone = onDone },
     PURCHASE_TIMEOUT, nil, "the server never confirmed the purchase.")
-  local ok, err = Call("PlaceBid", C_AuctionHouse.PlaceBid, offer.auctionID, offer.cost)
-  if not ok then self:FinishPurchase(p, false, "PlaceBid error: " .. tostring(err)) end
+  C_AuctionHouse.PlaceBid(offer.auctionID, offer.cost)
+end
+
+-- Alternative route: show Blizzard's own "Buyout this item?" dialog. When the
+-- player clicks Accept there, Blizzard's code places the bid.
+function M:BuyViaBlizzard(offer, onDone)
+  local dialogs = StaticPopupDialogs
+  if not (dialogs and dialogs.BUYOUT_AUCTION and StaticPopup_Show) then
+    onDone(false, "Blizzard's buyout dialog isn't available; open the Auction House's Buy tab once and try again.")
+    return
+  end
+  self:BeginTrace(("Blizzard buyout dialog for auction %d, %s"):format(offer.auctionID, ns.FormatMoneyPlain(offer.cost)))
+  local p = NewPurchase({ kind = "item", auctionID = offer.auctionID, onDone = onDone, viaBlizzard = true },
+    120, nil, "the buyout wasn't accepted in Blizzard's dialog.")
+  StaticPopup_Show("BUYOUT_AUCTION", nil, nil, { auctionID = offer.auctionID, buyout = offer.cost })
+  -- Notice when the dialog is closed without a purchase (Cancel / Escape).
+  if StaticPopup_Visible then
+    p.ticker = C_Timer.NewTicker(0.5, function()
+      if self.purchase ~= p then return end
+      if StaticPopup_Visible("BUYOUT_AUCTION") then
+        p.closedAt = nil
+      elseif not p.closedAt then
+        p.closedAt = GetTime()
+      elseif GetTime() - p.closedAt > 3 then
+        self:FinishPurchase(p, nil, "Blizzard's buyout dialog was closed without a purchase.")
+      end
+    end)
+  end
 end
 
 -- The unit price Blizzard's own buy button passes along: the average,
@@ -496,9 +547,13 @@ end
 -- onQuote(totalPrice, unitPrice) on success; onDone(false, err) if it fails.
 function M:QuoteCommodity(offer, quantity, expectedTotal, onQuote, onDone)
   local unitPrice = UnitPriceFor(expectedTotal, quantity)
+  if not (ValidAmount(offer.itemID) and ValidAmount(quantity) and ValidAmount(unitPrice)) then
+    onDone(false, "bad commodity data.")
+    return
+  end
   self:BeginTrace(("StartCommoditiesPurchase(item %d, %d, %s each)"):format(
     offer.itemID, quantity, ns.FormatMoneyPlain(unitPrice)))
-  local p = NewPurchase({
+  NewPurchase({
     kind = "commodity",
     itemID = offer.itemID,
     quantity = quantity,
@@ -506,9 +561,7 @@ function M:QuoteCommodity(offer, quantity, expectedTotal, onQuote, onDone)
     onQuote = onQuote,
     onDone = onDone,
   }, SEARCH_TIMEOUT, false, "no price quote from the server.")
-  local ok, err = Call("StartCommoditiesPurchase", C_AuctionHouse.StartCommoditiesPurchase,
-    offer.itemID, quantity, unitPrice)
-  if not ok then self:FinishPurchase(p, false, "StartCommoditiesPurchase error: " .. tostring(err)) end
+  C_AuctionHouse.StartCommoditiesPurchase(offer.itemID, quantity, unitPrice)
 end
 
 function M:ConfirmCommodity(quote, onDone)
@@ -525,9 +578,7 @@ function M:ConfirmCommodity(quote, onDone)
   p.timer = C_Timer.NewTimer(PURCHASE_TIMEOUT, function()
     self:FinishPurchase(p, nil, "the server never confirmed the purchase.")
   end)
-  local ok, err = Call("ConfirmCommoditiesPurchase", C_AuctionHouse.ConfirmCommoditiesPurchase,
-    quote.itemID, quote.quantity)
-  if not ok then self:FinishPurchase(p, false, "ConfirmCommoditiesPurchase error: " .. tostring(err)) end
+  C_AuctionHouse.ConfirmCommoditiesPurchase(quote.itemID, quote.quantity)
 end
 
 ns.On("COMMODITY_PRICE_UPDATED", function(_, unitPrice, totalPrice)

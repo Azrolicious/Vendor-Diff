@@ -227,9 +227,10 @@ function Buyer:BuyCurrent()
       Changed()
       return
     end
+    -- State first, then the restricted call, and only then any UI work, so
+    -- nothing runs between the click and the call.
     self.state = "QUOTING"
     self.message = ("Getting the exact price for %dx %s..."):format(quantity, ItemText(cand))
-    Changed()
     local vendor = quantity * offer.unitVendor
     ns.backend:QuoteCommodity(offer, quantity, expectedTotal, function(total)
       if token ~= self.token then return end
@@ -249,6 +250,7 @@ function Buyer:BuyCurrent()
       self:ReportFailure(("%dx %s"):format(quantity, cand.link or ItemText(cand)), err, ns.backend:EndTrace())
       self:Search(("Not bought: %s Details are in chat."):format(err or "no price quote."))
     end)
+    if token == self.token then Changed() end
     return
   end
 
@@ -257,18 +259,29 @@ function Buyer:BuyCurrent()
     Changed()
     return
   end
+  local viaBlizzard = ns.db.buyMode == "blizzard"
   self.state = "BUYING"
-  self.message = ("Buying %dx %s for %s..."):format(offer.quantity, ItemText(cand), ns.FormatMoney(offer.cost))
+  if viaBlizzard then
+    self.message = ("Click Accept in Blizzard's buyout window to buy %dx %s for %s."):format(
+      offer.quantity, ItemText(cand), ns.FormatMoney(offer.cost))
+  else
+    self.message = ("Buying %dx %s for %s..."):format(offer.quantity, ItemText(cand), ns.FormatMoney(offer.cost))
+  end
   self.pendingBuy = {
     cand = cand, link = offer.link, quantity = offer.quantity,
     vendor = offer.vendor, cost = offer.cost, moneyBefore = money,
   }
-  Changed()
-  ns.backend:Buy(offer, function(ok, err)
+  local function done(ok, err)
     if token ~= self.token then return end
     if self.pendingBuy then self.pendingBuy.ok, self.pendingBuy.err = ok, err end
     self:Search() -- SettlePurchase then reports the outcome
-  end)
+  end
+  if viaBlizzard then
+    ns.backend:BuyViaBlizzard(offer, done)
+  else
+    ns.backend:Buy(offer, done)
+  end
+  if token == self.token then Changed() end
 end
 
 function Buyer:ConfirmQuote()
@@ -286,12 +299,12 @@ function Buyer:ConfirmQuote()
   self.pendingBuy = {
     cand = cand, link = cand.link, quantity = q.quantity, vendor = q.vendor, cost = q.total, moneyBefore = money,
   }
-  Changed()
   ns.backend:ConfirmCommodity(q, function(ok, err)
     if token ~= self.token then return end
     if self.pendingBuy then self.pendingBuy.ok, self.pendingBuy.err = ok, err end
     self:Search()
   end)
+  if token == self.token then Changed() end
 end
 
 -- The main button. MUST only be called from a hardware event (a click or /click).
@@ -312,6 +325,7 @@ function Buyer:OnClick()
       if first then self:SetTarget(first.key) end
     end
   elseif state == "READY" or state == "CONFIRM" then
+    -- Nothing that touches the UI may run before the purchase call below.
     if not ns.backend:IsReady() then
       -- A purchase sent now could be queued behind the last request or dropped.
       self.message = "The Auction House is still busy with the last request. Click again in a moment."

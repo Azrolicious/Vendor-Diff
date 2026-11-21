@@ -217,7 +217,8 @@ test("purchases never happen without a click", function()
   -- A buggy addon path calling OnClick from a timer would be blocked by the client.
   ns.Buyer:OnClick()
   eq(#w.hwViolations, 1, "mock blocked PlaceBid outside a hardware event")
-  w:Advance(2)
+  eq(w.money, 1000000, "nothing bought")
+  w:Advance(8)
   ok(ns.Buyer.message:find("Not bought"), "the failure is shown, not swallowed")
 end)
 
@@ -237,21 +238,63 @@ test("a purchase the client silently blocks is reported, not retried quietly", f
   eq(ns.Buyer.state, "READY", "listing offered again")
   ok(ns.Buyer.message:find("^Not bought: the server never confirmed the purchase"), "status line says it failed")
   ok(w:ChatContains("was not bought"), "failure printed in chat")
-  ok(w:ChatContains("PlaceBid%(auction 501, 30s%); Auction House ready: true"), "trace shows the call")
+  ok(w:ChatContains("PlaceBid%(auction 501, 30s%); Auction House ready: true; addon restrictions active: none"),
+    "trace shows the call and the restriction state")
   ok(w:ChatContains("ADDON_ACTION_BLOCKED%(VendorDiff, C_AuctionHouse.PlaceBid%(%)%)"), "trace shows the block")
 end)
 
-test("a Lua error inside PlaceBid is caught and reported", function()
+test("a Lua error inside PlaceBid surfaces and the failure is still reported", function()
   local w = NewMarket({ fillers = 10 })
   local ns = Boot(w)
   ScanDone(w, ns)
   w.placeBidMode = "error"
   w:Click(ns.UI.buyButton)
   w:Advance(1)
+  -- PlaceBid is called directly (not through pcall), so its error reaches the
+  -- game's error display like any other Lua error.
+  ok(not pcall(w.Click, w, ns.UI.buyButton), "Lua error is not swallowed")
+  w:Advance(8)
+  ok(ns.Buyer.message:find("^Not bought: the server never confirmed"), "status line reports the failure")
+end)
+
+test("buy mode 'blizzard' buys through Blizzard's own buyout dialog", function()
+  local w = NewMarket({ fillers = 10 })
+  local ns = Boot(w)
+  ScanDone(w, ns)
+  w.env.SlashCmdList.VENDORDIFF("buymode blizzard")
+  eq(ns.db.buyMode, "blizzard", "mode saved")
+  w.placeBidMode = "blocked" -- addon calls are refused; Blizzard's dialog isn't
+  w:Click(ns.UI.buyButton) -- Start
+  w:Advance(1)
+  local money = w.money
+  w:Click(ns.UI.buyButton) -- Buy
+  eq(count(w.calls.PlaceBid), 0, "Vendor Diff didn't bid itself")
+  eq(w.calls.StaticPopup_Show[1][1], "BUYOUT_AUCTION", "Blizzard's dialog shown")
+  eq(w.calls.StaticPopup_Show[1][2].auctionID, 501, "for the right auction")
+  eq(w.calls.StaticPopup_Show[1][2].buyout, 3000, "at its buyout")
+  ok(ns.Buyer.message:find("Click Accept"), "tells the player what to do")
+  w:Advance(2)
+  eq(ns.Buyer.state, "BUYING", "waits for the player")
+  w:AcceptPopup()
+  w:Advance(2)
+  eq(w.money, money - 3000, "bought")
+  eq(ns.Buyer.session.purchases, 1, "purchase recorded")
+  eq(#w.hwViolations, 0, "nothing blocked")
+end)
+
+test("closing Blizzard's buyout dialog is reported as not bought", function()
+  local w = NewMarket({ fillers = 10 })
+  local ns = Boot(w)
+  ScanDone(w, ns)
+  ns.db.buyMode = "blizzard"
   w:Click(ns.UI.buyButton)
-  w:Advance(3)
-  ok(ns.Buyer.message:find("Not bought: PlaceBid error"), "status line shows the error")
-  ok(w:ChatContains("PlaceBid raised a Lua error"), "trace shows the error")
+  w:Advance(1)
+  w:Click(ns.UI.buyButton)
+  w:Advance(1)
+  w:CancelPopup()
+  w:Advance(6)
+  eq(ns.Buyer.state, "READY", "listing offered again")
+  ok(ns.Buyer.message:find("closed without a purchase"), "says the dialog was closed")
 end)
 
 test("buying waits until the Auction House isn't busy", function()

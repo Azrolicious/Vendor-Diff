@@ -168,7 +168,7 @@ local MODERN_EVENTS = {
   "UI_ERROR_MESSAGE", "AUCTION_HOUSE_THROTTLED_SYSTEM_READY",
   "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED", "AUCTION_HOUSE_BROWSE_FAILURE",
   "PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
-  "ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN", "PLAYER_MONEY",
+  "ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN", "PLAYER_MONEY", "ADDON_RESTRICTION_STATE_CHANGED",
   "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT",
   "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED",
   "AUCTION_HOUSE_SHOW_NOTIFICATION", "AUCTION_HOUSE_SHOW_FORMATTED_NOTIFICATION",
@@ -215,11 +215,29 @@ function World:Call(name, ...)
   list[#list + 1] = { ... }
 end
 
+-- Like the client: a restricted call outside a hardware event fires
+-- ADDON_ACTION_BLOCKED and does nothing (no Lua error). Returns false then.
 function World:RequireHardware(name)
   if not self.hardware then
     table.insert(self.hwViolations, name)
-    error(name .. " called outside a hardware event", 3)
+    self:Fire("ADDON_ACTION_BLOCKED", "VendorDiff", name .. "()")
+    return false
   end
+  return true
+end
+
+-- Blizzard's StaticPopup, enough for BUYOUT_AUCTION.
+function World:AcceptPopup()
+  local popup = assert(self.popup, "no popup shown")
+  self.popup = nil
+  self.hardware, self.secureCaller = true, true
+  local ok, err = pcall(self.env.StaticPopupDialogs[popup.which].OnAccept, {}, popup.data)
+  self.hardware, self.secureCaller = false, false
+  if not ok then error(err, 2) end
+end
+
+function World:CancelPopup()
+  self.popup = nil
 end
 
 -- Timers ------------------------------------------------------------------
@@ -404,10 +422,25 @@ function World:BuildEnv()
   env.UnitName = function() return world.playerName end
   env.GetRealmName = function() return "TestRealm" end
   env.GetMoney = function() return world.money end
+  env.InCombatLockdown = function() return false end
+  env.C_RestrictedActions = {
+    IsAddOnRestrictionActive = function(kind) return world.activeRestriction == kind end,
+  }
+  env.StaticPopupDialogs = {}
+  env.StaticPopup_Show = function(which, _, _, data)
+    assert(env.StaticPopupDialogs[which], "unknown popup " .. tostring(which))
+    world:Call("StaticPopup_Show", which, data)
+    world.popup = { which = which, data = data }
+  end
+  env.StaticPopup_Visible = function(which) return world.popup ~= nil and world.popup.which == which end
+  env.StaticPopup_Hide = function(which)
+    if world.popup and world.popup.which == which then world.popup = nil end
+  end
   env.Enum = {
     AuctionHouseSortOrder = { Price = 0 },
     ItemClass = { Weapon = 2, Armor = 4 },
     PlayerInteractionType = { Auctioneer = 21 },
+    AddOnRestrictionType = { Combat = 0, Encounter = 1 },
   }
   env.ITEM_QUALITY_COLORS = {}
   for q = 0, 8 do env.ITEM_QUALITY_COLORS[q] = { hex = "|cffq" .. q } end
@@ -463,7 +496,7 @@ function World:BuildModernAH()
   world.browseFail = false     -- reply with AUCTION_HOUSE_BROWSE_FAILURE
   world.browseStallAfter = nil -- stop answering after this many pages
   world.sellTabViolations = 0  -- AH requests sent while Blizzard's Sell tab was visible
-  world.placeBidMode = nil     -- nil = works, "blocked" = client silently blocks it, "error" = Lua error
+  world.placeBidMode = nil     -- nil = works, "blocked" = blocked unless Blizzard's dialog calls it, "error" = Lua error
   local ah = Widget.new(world, "Frame", "AuctionHouseFrame")
   rawset(ah, "ItemSellFrame", Widget.new(world, "Frame", nil, ah))
   rawset(ah, "CommoditiesSellFrame", Widget.new(world, "Frame", nil, ah))
@@ -541,6 +574,9 @@ function World:BuildModernAH()
 
   local AH = {}
   env.C_AuctionHouse = AH
+  env.StaticPopupDialogs.BUYOUT_AUCTION = {
+    OnAccept = function(_, data) AH.PlaceBid(data.auctionID, data.buyout) end,
+  }
   function AH.SendBrowseQuery(query)
     assert(world.throttleReady, "SendBrowseQuery while throttled")
     assert(type(query) == "table" and query.searchString == "" and type(query.sorts) == "table",
@@ -618,7 +654,7 @@ function World:BuildModernAH()
   end
 
   function AH.StartCommoditiesPurchase(id, quantity, unitPrice)
-    world:RequireHardware("StartCommoditiesPurchase") -- HasRestrictions in the Forever API docs
+    if not world:RequireHardware("StartCommoditiesPurchase") then return end
     sentRequest()
     world:Call("StartCommoditiesPurchase", id, quantity, unitPrice)
     world.quote = { itemID = id, quantity = quantity }
@@ -638,7 +674,7 @@ function World:BuildModernAH()
     world.quote = nil
   end
   function AH.ConfirmCommoditiesPurchase(id, quantity)
-    world:RequireHardware("ConfirmCommoditiesPurchase")
+    if not world:RequireHardware("ConfirmCommoditiesPurchase") then return end
     sentRequest()
     world:Call("ConfirmCommoditiesPurchase", id, quantity)
     local total = commodityQuote(id, quantity)
@@ -662,10 +698,10 @@ function World:BuildModernAH()
     world:FireLater(0.2, "COMMODITY_PURCHASE_SUCCEEDED")
   end
   function AH.PlaceBid(auctionID, amount)
-    world:RequireHardware("PlaceBid") -- HasRestrictions in the Forever API docs
+    if not world:RequireHardware("PlaceBid") then return end
     sentRequest()
     world:Call("PlaceBid", auctionID, amount)
-    if world.placeBidMode == "blocked" then
+    if world.placeBidMode == "blocked" and not world.secureCaller then
       world:Fire("ADDON_ACTION_BLOCKED", "VendorDiff", "C_AuctionHouse.PlaceBid()")
       return
     elseif world.placeBidMode == "error" then

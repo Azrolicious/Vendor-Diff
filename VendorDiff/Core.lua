@@ -2,7 +2,7 @@
 local ADDON_NAME, ns = ...
 
 ns.ADDON_NAME = ADDON_NAME
-ns.VERSION = "0.2.1"
+ns.VERSION = "0.2.2"
 
 local DEFAULTS = {
   minProfit = 1,          -- copper; a listing must beat the vendor price by at least this much
@@ -10,6 +10,7 @@ local DEFAULTS = {
   ignore = {},            -- [itemID] = true, never show these
   position = nil,         -- saved window position {point, relPoint, x, y}
   debug = false,          -- print Auction House traffic during purchases
+  buyMode = "direct",     -- "direct": Vendor Diff places the bid; "blizzard": via Blizzard's buyout dialog
 }
 
 ---------------------------------------------------------------------------
@@ -246,6 +247,7 @@ local HELP = {
   "/vd unignore <item link or ID|all> - stop ignoring",
   "/vd autoopen - toggle opening with the Auction House",
   "/vd debug - toggle printing what the Auction House reports during searches and purchases",
+  "/vd buymode direct|blizzard - buy directly, or through Blizzard's own buyout dialog (current: %s)",
   "/vd reset - reset the window position",
 }
 
@@ -285,6 +287,16 @@ SlashCmdList.VENDORDIFF = function(input)
     if not id then ns.Print("Usage: /vd unignore <item link or ID|all>") return end
     ns.db.ignore[id] = nil
     ns.Print("No longer ignoring item " .. id .. ". Rescan to see it.")
+  elseif cmd == "buymode" then
+    local mode = rest:lower()
+    if mode ~= "direct" and mode ~= "blizzard" then
+      ns.Print("Usage: /vd buymode direct  or  /vd buymode blizzard  (current: " .. ns.db.buyMode .. ")")
+      return
+    end
+    ns.db.buyMode = mode
+    ns.Print(mode == "blizzard"
+      and "Buy mode: Blizzard. Buy opens Blizzard's buyout dialog; click Accept there to buy."
+      or "Buy mode: direct. Vendor Diff places the bid itself.")
   elseif cmd == "debug" then
     ns.db.debug = not ns.db.debug
     ns.Print("Debug output: " .. (ns.db.debug and "on" or "off"))
@@ -297,7 +309,12 @@ SlashCmdList.VENDORDIFF = function(input)
     ns.Print("Window position reset.")
   else
     for _, line in ipairs(HELP) do
-      ns.Print(line:format(ns.FormatMoneyPlain(ns.db.minProfit)))
+      if line:find("minprofit") then
+        line = line:format(ns.FormatMoneyPlain(ns.db.minProfit))
+      elseif line:find("buymode") then
+        line = line:format(ns.db.buyMode)
+      end
+      ns.Print(line)
     end
   end
 end
