@@ -392,8 +392,73 @@ ns.On("ITEM_SEARCH_RESULTS_UPDATED", function(_, itemKey) M:OnItemResults(itemKe
 ns.On("ITEM_SEARCH_RESULTS_ADDED", function(_, itemKey) M:OnItemResults(itemKey) end)
 
 ---------------------------------------------------------------------------
--- Purchasing. Buy / ConfirmCommodity must run inside a hardware event (click).
--- A purchase object carries onDone(ok, err); commodity quotes also onQuote.
+-- Purchase diagnostics. Everything the client reports between a purchase
+-- click and the follow-up search is recorded, so a purchase that doesn't go
+-- through can say why (blocked action, dropped request, AH error, ...).
+---------------------------------------------------------------------------
+local trace
+
+local function Trace(fmt, ...)
+  local line = select("#", ...) > 0 and fmt:format(...) or fmt
+  if trace then trace[#trace + 1] = line end
+  if ns.db and ns.db.debug then ns.Print("|cff999999debug:|r " .. line) end
+end
+M.Trace = Trace
+
+function M:BeginTrace(what)
+  trace = {}
+  Trace("%s; Auction House ready: %s", what, tostring(C_AuctionHouse.IsThrottledMessageSystemReady()))
+end
+
+-- Stop recording and return what was seen since BeginTrace.
+function M:EndTrace()
+  local t = trace
+  trace = nil
+  return t
+end
+
+-- False while the AH is still working on an earlier request.
+function M:IsReady()
+  return C_AuctionHouse.IsThrottledMessageSystemReady()
+end
+
+local function TraceEvent(event, ...)
+  if not trace then return end
+  if event == "PLAYER_MONEY" then
+    Trace("PLAYER_MONEY: now %s", ns.FormatMoneyPlain(GetMoney()))
+    return
+  end
+  local args = {}
+  for i = 1, select("#", ...) do args[i] = tostring((select(i, ...))) end
+  Trace("%s(%s)", event, table.concat(args, ", "))
+end
+
+-- Registered before the purchase handlers below, so the trace shows each
+-- event before we react to it. Unknown events are skipped by ns.On.
+for _, event in ipairs({
+  "ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN",
+  "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT",
+  "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED",
+  "AUCTION_HOUSE_SHOW_ERROR", "AUCTION_HOUSE_SHOW_NOTIFICATION", "AUCTION_HOUSE_SHOW_FORMATTED_NOTIFICATION",
+  "AUCTION_HOUSE_PURCHASE_COMPLETED", "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE",
+  "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED", "UI_ERROR_MESSAGE", "PLAYER_MONEY",
+}) do
+  ns.On(event, TraceEvent)
+end
+
+-- Call a purchase API, catching Lua errors so they're reported instead of
+-- disappearing (the game hides Lua errors unless scriptErrors is on).
+local function Call(name, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then Trace("%s raised a Lua error: %s", name, tostring(err)) end
+  return ok, err
+end
+
+---------------------------------------------------------------------------
+-- Purchasing. Buy / QuoteCommodity / ConfirmCommodity must run inside a
+-- hardware event (click). A purchase carries onDone(ok, err), where ok is
+-- true (confirmed), false (failed) or nil (no answer from the server; the
+-- Buyer checks whether gold was spent). Commodity quotes also get onQuote.
 ---------------------------------------------------------------------------
 function M:FinishPurchase(p, ok, err)
   if self.purchase ~= p then return end
@@ -402,8 +467,7 @@ function M:FinishPurchase(p, ok, err)
   p.onDone(ok, err)
 end
 
--- When the timer runs out we report (timeoutOk, timeoutErr). For a purchase
--- that means "no confirmation arrived; the follow-up search shows what happened".
+-- When the timer runs out we report (timeoutOk, timeoutErr).
 local function NewPurchase(p, timeout, timeoutOk, timeoutErr)
   M.purchase = p
   p.timer = C_Timer.NewTimer(timeout, function() M:FinishPurchase(p, timeoutOk, timeoutErr) end)
@@ -411,14 +475,30 @@ local function NewPurchase(p, timeout, timeoutOk, timeoutErr)
 end
 
 function M:Buy(offer, onDone)
-  NewPurchase({ kind = "item", auctionID = offer.auctionID, onDone = onDone }, PURCHASE_TIMEOUT, true)
-  C_AuctionHouse.PlaceBid(offer.auctionID, offer.cost)
+  self:BeginTrace(("PlaceBid(auction %s, %s)"):format(tostring(offer.auctionID), ns.FormatMoneyPlain(offer.cost)))
+  local p = NewPurchase({ kind = "item", auctionID = offer.auctionID, onDone = onDone },
+    PURCHASE_TIMEOUT, nil, "the server never confirmed the purchase.")
+  local ok, err = Call("PlaceBid", C_AuctionHouse.PlaceBid, offer.auctionID, offer.cost)
+  if not ok then self:FinishPurchase(p, false, "PlaceBid error: " .. tostring(err)) end
+end
+
+-- The unit price Blizzard's own buy button passes along: the average,
+-- rounded up (to whole silver when the AH doesn't take copper).
+local function UnitPriceFor(total, quantity)
+  local raw = total / quantity
+  if C_AuctionHouse.SupportsCopperValues and not C_AuctionHouse.SupportsCopperValues() then
+    return math.ceil(raw / 100) * 100
+  end
+  return math.ceil(raw)
 end
 
 -- Ask the server for the exact total price of `quantity` units.
 -- onQuote(totalPrice, unitPrice) on success; onDone(false, err) if it fails.
-function M:QuoteCommodity(offer, quantity, onQuote, onDone)
-  NewPurchase({
+function M:QuoteCommodity(offer, quantity, expectedTotal, onQuote, onDone)
+  local unitPrice = UnitPriceFor(expectedTotal, quantity)
+  self:BeginTrace(("StartCommoditiesPurchase(item %d, %d, %s each)"):format(
+    offer.itemID, quantity, ns.FormatMoneyPlain(unitPrice)))
+  local p = NewPurchase({
     kind = "commodity",
     itemID = offer.itemID,
     quantity = quantity,
@@ -426,7 +506,9 @@ function M:QuoteCommodity(offer, quantity, onQuote, onDone)
     onQuote = onQuote,
     onDone = onDone,
   }, SEARCH_TIMEOUT, false, "no price quote from the server.")
-  C_AuctionHouse.StartCommoditiesPurchase(offer.itemID, quantity)
+  local ok, err = Call("StartCommoditiesPurchase", C_AuctionHouse.StartCommoditiesPurchase,
+    offer.itemID, quantity, unitPrice)
+  if not ok then self:FinishPurchase(p, false, "StartCommoditiesPurchase error: " .. tostring(err)) end
 end
 
 function M:ConfirmCommodity(quote, onDone)
@@ -435,11 +517,17 @@ function M:ConfirmCommodity(quote, onDone)
     onDone(false, "the price quote expired.")
     return
   end
+  Trace("ConfirmCommoditiesPurchase(item %d, %d); Auction House ready: %s",
+    quote.itemID, quote.quantity, tostring(C_AuctionHouse.IsThrottledMessageSystemReady()))
   p.onDone = onDone
   p.confirming = true
   if p.timer then p.timer:Cancel() end
-  p.timer = C_Timer.NewTimer(PURCHASE_TIMEOUT, function() self:FinishPurchase(p, true) end)
-  C_AuctionHouse.ConfirmCommoditiesPurchase(quote.itemID, quote.quantity)
+  p.timer = C_Timer.NewTimer(PURCHASE_TIMEOUT, function()
+    self:FinishPurchase(p, nil, "the server never confirmed the purchase.")
+  end)
+  local ok, err = Call("ConfirmCommoditiesPurchase", C_AuctionHouse.ConfirmCommoditiesPurchase,
+    quote.itemID, quote.quantity)
+  if not ok then self:FinishPurchase(p, false, "ConfirmCommoditiesPurchase error: " .. tostring(err)) end
 end
 
 ns.On("COMMODITY_PRICE_UPDATED", function(_, unitPrice, totalPrice)
@@ -476,9 +564,11 @@ ns.On("AUCTION_HOUSE_PURCHASE_COMPLETED", function(_, auctionID)
   end
 end)
 
-ns.On("AUCTION_HOUSE_SHOW_ERROR", function()
+ns.On("AUCTION_HOUSE_SHOW_ERROR", function(_, code)
   local p = M.purchase
-  if p and p.kind == "item" then M:FinishPurchase(p, false, "the Auction House reported an error.") end
+  if p and p.kind == "item" then
+    M:FinishPurchase(p, false, ("the Auction House reported error %s."):format(tostring(code)))
+  end
 end)
 
 ns.Listen("AH_CLOSED", function()

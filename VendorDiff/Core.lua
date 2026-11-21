@@ -2,13 +2,14 @@
 local ADDON_NAME, ns = ...
 
 ns.ADDON_NAME = ADDON_NAME
-ns.VERSION = "0.2.0"
+ns.VERSION = "0.2.1"
 
 local DEFAULTS = {
   minProfit = 1,          -- copper; a listing must beat the vendor price by at least this much
   autoOpen = true,        -- open the window when the Auction House opens
   ignore = {},            -- [itemID] = true, never show these
   position = nil,         -- saved window position {point, relPoint, x, y}
+  debug = false,          -- print Auction House traffic during purchases
 }
 
 ---------------------------------------------------------------------------
@@ -244,6 +245,7 @@ local HELP = {
   "/vd ignore <item link or ID> - never show an item",
   "/vd unignore <item link or ID|all> - stop ignoring",
   "/vd autoopen - toggle opening with the Auction House",
+  "/vd debug - toggle printing what the Auction House reports during searches and purchases",
   "/vd reset - reset the window position",
 }
 
@@ -283,6 +285,9 @@ SlashCmdList.VENDORDIFF = function(input)
     if not id then ns.Print("Usage: /vd unignore <item link or ID|all>") return end
     ns.db.ignore[id] = nil
     ns.Print("No longer ignoring item " .. id .. ". Rescan to see it.")
+  elseif cmd == "debug" then
+    ns.db.debug = not ns.db.debug
+    ns.Print("Debug output: " .. (ns.db.debug and "on" or "off"))
   elseif cmd == "autoopen" then
     ns.db.autoOpen = not ns.db.autoOpen
     ns.Print("Open with Auction House: " .. (ns.db.autoOpen and "on" or "off"))

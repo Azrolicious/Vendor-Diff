@@ -45,6 +45,7 @@ Every purchase needs a click: Blizzard only allows buying from the Auction House
 /vd ignore <link|id>    never show an item
 /vd unignore <link|id>  stop ignoring an item  (/vd unignore all clears the list)
 /vd autoopen            toggle opening with the Auction House
+/vd debug               print what the Auction House reports during searches and purchases
 /vd reset               reset the window position
 ```
 
@@ -56,6 +57,7 @@ The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiff
 - **Verify:** before you can buy, a live `C_AuctionHouse.SendSearchQuery` fetches the item's current listings. Only listings that are still below vendor price, and aren't your own, become buyable. The list row updates to the live numbers.
 - **Buy:** `C_AuctionHouse.PlaceBid` for items. `StartCommoditiesPurchase` / `ConfirmCommoditiesPurchase` for commodities. After each purchase the item is searched again, so the next click always acts on fresh data.
 - **Profit tracking:** a purchase is counted only once the gold actually leaves your bags. The session total appears at the bottom of the window.
+- **Failed purchases:** if no gold leaves your bags, the status line says **Not bought** and chat lists everything the game reported for that click: the purchase call, blocked actions, Auction House errors, and dropped or queued requests. Turn on `/vd debug` to see the same information live.
 
 ## Caveats
 

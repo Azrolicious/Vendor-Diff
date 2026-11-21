@@ -44,20 +44,44 @@ function Buyer:CanAct()
   return true
 end
 
--- If money left our bags since the last purchase attempt, record it.
+-- Print why a purchase didn't happen, with everything the game reported.
+function Buyer:ReportFailure(what, reason, lines)
+  ns.Print(("%s was not bought: %s"):format(what, reason or "no reason given."))
+  if lines and #lines > 0 then
+    ns.Print("What the game reported:")
+    for i = 1, math.min(#lines, 15) do
+      ns.Print("  " .. lines[i])
+    end
+  else
+    ns.Print("The game reported nothing back.")
+  end
+end
+
+-- Called when the follow-up search after a purchase is back (or on reset).
+-- Gold leaving our bags is the proof of a purchase. Returns a status-line
+-- note when the purchase didn't go through.
 function Buyer:SettlePurchase()
   local p = self.pendingBuy
-  if not p then return end
+  if not p then return nil end
   self.pendingBuy = nil
+  local lines = ns.backend:EndTrace()
   local spent = p.moneyBefore - GetMoney()
-  if spent <= 0 then return end
+  if spent <= 0 and p.ok == true then
+    spent = p.cost -- confirmed, but the gold update hasn't arrived yet
+  end
+  local what = ("%dx %s"):format(p.quantity, p.link or ItemText(p.cand))
+  if spent <= 0 then
+    local reason = p.err or "the server never confirmed the purchase."
+    self:ReportFailure(what, reason, lines)
+    return "Not bought: " .. reason .. " Details are in chat."
+  end
   local s = self.session
   s.purchases = s.purchases + 1
   s.spent = s.spent + spent
   s.value = s.value + p.vendor
-  ns.Print(("Bought %dx %s for %s (vendors for %s, profit %s)."):format(
-    p.quantity, p.link or ItemText(p.cand), ns.FormatMoney(spent),
-    ns.FormatMoney(p.vendor), ns.FormatMoney(p.vendor - spent)))
+  ns.Print(("Bought %s for %s (vendors for %s, profit %s)."):format(
+    what, ns.FormatMoney(spent), ns.FormatMoney(p.vendor), ns.FormatMoney(p.vendor - spent)))
+  return nil
 end
 
 function Buyer:Reset(message)
@@ -115,10 +139,11 @@ function Buyer:Search(note)
 end
 
 function Buyer:OnSearchResult(cand, offers, err, live)
-  self:SettlePurchase()
+  local failNote = self:SettlePurchase()
+  if failNote then self.note = failNote end
   if not offers then
     self.state = "FAILED"
-    self.message = "Search failed: " .. (err or "unknown error")
+    self.message = (self.note and (self.note .. " ") or "") .. "Search failed: " .. (err or "unknown error")
     Changed()
     return
   end
@@ -132,7 +157,8 @@ function Buyer:OnSearchResult(cand, offers, err, live)
     if o.vendor - o.cost >= minProfit then good[#good + 1] = o end
   end
   if #good == 0 then
-    self:Advance(cand, "Nothing below vendor price left for " .. ItemText(cand) .. ".")
+    self:Advance(cand, (failNote and (failNote .. " ") or "")
+      .. "Nothing below vendor price left for " .. ItemText(cand) .. ".")
     return
   end
 
@@ -195,7 +221,7 @@ function Buyer:BuyCurrent()
   local token = self.token
 
   if offer.kind == "commodity" then
-    local quantity = AffordableCommodity(offer, money)
+    local quantity, expectedTotal = AffordableCommodity(offer, money)
     if quantity == 0 then
       self.message = "Not enough gold to buy any " .. ItemText(cand) .. "."
       Changed()
@@ -205,10 +231,11 @@ function Buyer:BuyCurrent()
     self.message = ("Getting the exact price for %dx %s..."):format(quantity, ItemText(cand))
     Changed()
     local vendor = quantity * offer.unitVendor
-    ns.backend:QuoteCommodity(offer, quantity, function(total)
+    ns.backend:QuoteCommodity(offer, quantity, expectedTotal, function(total)
       if token ~= self.token then return end
       if not total or total + ns.db.minProfit > vendor then
         ns.backend:CancelAll()
+        ns.backend:EndTrace()
         self:Search(("Price went up to %s; no longer below vendor."):format(ns.FormatMoney(total or 0)))
         return
       end
@@ -219,7 +246,8 @@ function Buyer:BuyCurrent()
       Changed()
     end, function(_, err)
       if token ~= self.token then return end
-      self:Search(err and ("Not bought: " .. err) or nil)
+      self:ReportFailure(("%dx %s"):format(quantity, cand.link or ItemText(cand)), err, ns.backend:EndTrace())
+      self:Search(("Not bought: %s Details are in chat."):format(err or "no price quote."))
     end)
     return
   end
@@ -233,12 +261,13 @@ function Buyer:BuyCurrent()
   self.message = ("Buying %dx %s for %s..."):format(offer.quantity, ItemText(cand), ns.FormatMoney(offer.cost))
   self.pendingBuy = {
     cand = cand, link = offer.link, quantity = offer.quantity,
-    vendor = offer.vendor, moneyBefore = money,
+    vendor = offer.vendor, cost = offer.cost, moneyBefore = money,
   }
   Changed()
   ns.backend:Buy(offer, function(ok, err)
     if token ~= self.token then return end
-    self:Search((not ok and err) and ("Not bought: " .. err) or nil)
+    if self.pendingBuy then self.pendingBuy.ok, self.pendingBuy.err = ok, err end
+    self:Search() -- SettlePurchase then reports the outcome
   end)
 end
 
@@ -254,11 +283,14 @@ function Buyer:ConfirmQuote()
   local token = self.token
   self.state = "BUYING"
   self.message = ("Buying %dx %s for %s..."):format(q.quantity, ItemText(cand), ns.FormatMoney(q.total))
-  self.pendingBuy = { cand = cand, link = cand.link, quantity = q.quantity, vendor = q.vendor, moneyBefore = money }
+  self.pendingBuy = {
+    cand = cand, link = cand.link, quantity = q.quantity, vendor = q.vendor, cost = q.total, moneyBefore = money,
+  }
   Changed()
   ns.backend:ConfirmCommodity(q, function(ok, err)
     if token ~= self.token then return end
-    self:Search((not ok and err) and ("Not bought: " .. err) or nil)
+    if self.pendingBuy then self.pendingBuy.ok, self.pendingBuy.err = ok, err end
+    self:Search()
   end)
 end
 
@@ -279,10 +311,14 @@ function Buyer:OnClick()
       local first = ns.Results:GetSorted()[1]
       if first then self:SetTarget(first.key) end
     end
-  elseif state == "READY" then
-    self:BuyCurrent()
-  elseif state == "CONFIRM" then
-    self:ConfirmQuote()
+  elseif state == "READY" or state == "CONFIRM" then
+    if not ns.backend:IsReady() then
+      -- A purchase sent now could be queued behind the last request or dropped.
+      self.message = "The Auction House is still busy with the last request. Click again in a moment."
+      Changed()
+      return
+    end
+    if state == "READY" then self:BuyCurrent() else self:ConfirmQuote() end
   end
 end
 

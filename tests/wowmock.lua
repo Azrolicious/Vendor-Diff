@@ -168,6 +168,10 @@ local MODERN_EVENTS = {
   "UI_ERROR_MESSAGE", "AUCTION_HOUSE_THROTTLED_SYSTEM_READY",
   "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED", "AUCTION_HOUSE_BROWSE_FAILURE",
   "PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
+  "ADDON_ACTION_BLOCKED", "ADDON_ACTION_FORBIDDEN", "PLAYER_MONEY",
+  "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT",
+  "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", "AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED",
+  "AUCTION_HOUSE_SHOW_NOTIFICATION", "AUCTION_HOUSE_SHOW_FORMATTED_NOTIFICATION",
   "COMMODITY_SEARCH_RESULTS_UPDATED", "COMMODITY_SEARCH_RESULTS_ADDED", "ITEM_SEARCH_RESULTS_UPDATED",
   "ITEM_SEARCH_RESULTS_ADDED", "COMMODITY_PRICE_UPDATED", "COMMODITY_PRICE_UNAVAILABLE",
   "COMMODITY_PURCHASE_SUCCEEDED", "COMMODITY_PURCHASE_FAILED", "AUCTION_HOUSE_PURCHASE_COMPLETED",
@@ -459,6 +463,7 @@ function World:BuildModernAH()
   world.browseFail = false     -- reply with AUCTION_HOUSE_BROWSE_FAILURE
   world.browseStallAfter = nil -- stop answering after this many pages
   world.sellTabViolations = 0  -- AH requests sent while Blizzard's Sell tab was visible
+  world.placeBidMode = nil     -- nil = works, "blocked" = client silently blocks it, "error" = Lua error
   local ah = Widget.new(world, "Frame", "AuctionHouseFrame")
   rawset(ah, "ItemSellFrame", Widget.new(world, "Frame", nil, ah))
   rawset(ah, "CommoditiesSellFrame", Widget.new(world, "Frame", nil, ah))
@@ -567,6 +572,7 @@ function World:BuildModernAH()
     return { itemID = itemID, itemLevel = itemLevel or 0, itemSuffix = itemSuffix or 0, battlePetSpeciesID = species or 0 }
   end
   function AH.IsThrottledMessageSystemReady() return world.throttleReady end
+  function AH.SupportsCopperValues() return true end
   function AH.SendSearchQuery(itemKey, sorts, separateOwnerItems)
     assert(world.throttleReady, "SendSearchQuery while throttled")
     sentRequest()
@@ -611,10 +617,10 @@ function World:BuildModernAH()
     return left == 0 and total or nil, unit
   end
 
-  function AH.StartCommoditiesPurchase(id, quantity)
+  function AH.StartCommoditiesPurchase(id, quantity, unitPrice)
     world:RequireHardware("StartCommoditiesPurchase") -- HasRestrictions in the Forever API docs
     sentRequest()
-    world:Call("StartCommoditiesPurchase", id, quantity)
+    world:Call("StartCommoditiesPurchase", id, quantity, unitPrice)
     world.quote = { itemID = id, quantity = quantity }
     if world.priceBump then
       world.priceBump()
@@ -641,6 +647,7 @@ function World:BuildModernAH()
       return
     end
     world.money = world.money - total
+    world:FireLater(0.05, "PLAYER_MONEY")
     local left = quantity
     for _, r in ipairs(sortedCommodity(id)) do
       local avail = r.quantity - (r.numOwnerItems or 0)
@@ -658,11 +665,18 @@ function World:BuildModernAH()
     world:RequireHardware("PlaceBid") -- HasRestrictions in the Forever API docs
     sentRequest()
     world:Call("PlaceBid", auctionID, amount)
+    if world.placeBidMode == "blocked" then
+      world:Fire("ADDON_ACTION_BLOCKED", "VendorDiff", "C_AuctionHouse.PlaceBid()")
+      return
+    elseif world.placeBidMode == "error" then
+      error("Usage: C_AuctionHouse.PlaceBid(auctionID, bidAmount)")
+    end
     for id, list in pairs(world.itemAuctions) do
       for i, a in ipairs(list) do
         if a.auctionID == auctionID then
           assert(amount == a.buyout, "PlaceBid amount mismatch")
           world.money = world.money - amount
+          world:FireLater(0.05, "PLAYER_MONEY")
           table.remove(list, i)
           if world.knownEvents.AUCTION_HOUSE_PURCHASE_COMPLETED then
             world:FireLater(0.2, "AUCTION_HOUSE_PURCHASE_COMPLETED", auctionID)
