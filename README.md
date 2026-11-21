@@ -1,0 +1,86 @@
+# Vendor Diff
+
+A **World of Warcraft: Forever** addon that scans the Auction House for listings whose buyout price is **below what a vendor pays** for the item, and lets you buy them for guaranteed profit: buy, then sell to any vendor.
+
+## Install
+
+1. Copy the `VendorDiff` folder (the one containing `VendorDiff.toc`) into your WoW Forever installation's `Interface/AddOns/` folder.
+2. **Fully restart the game.** On Forever, `/reload` does not pick up newly added addon folders.
+3. Make sure *Vendor Diff* is enabled in the AddOns list on the character screen.
+
+The TOC targets interface `16001` (Forever client 1.60.1). If the AddOns list marks it out of date after a patch, update the `## Interface:` line in `VendorDiff/VendorDiff.toc` to the value from `/dump select(4, GetBuildInfo())`.
+
+## Use
+
+1. Talk to an auctioneer. The Vendor Diff window opens next to the Auction House.
+2. Click **Scan**. This requests a full copy of every listing from the server, which allows one full scan every 15 minutes. The list fills with every item that has listings below vendor price, sorted by profit.
+3. Click **Start** (or click a row). Vendor Diff runs a live search for that item to confirm the listings still exist at that price.
+4. Click **Buy**.
+   - **Gear and other non-stacking items** are bought one auction per click.
+   - **Commodities** (stackable goods like cloth and herbs) take two clicks. **Buy** asks the server for the exact total price of every unit below vendor price. **Confirm** buys them. If the price has risen above vendor value by then, the purchase is cancelled.
+5. When an item is used up, Vendor Diff moves to the next one and searches it automatically. Items that sold out since the scan are skipped.
+6. Collect your purchases from the mailbox and sell them to a vendor.
+
+Every purchase needs a click: Blizzard only allows buying from the Auction House in response to a key press or mouse click. Vendor Diff never buys on its own.
+
+### Controls
+
+| Action | Effect |
+| --- | --- |
+| Left-click row | Select the item and search its live listings |
+| Shift-click row | Link the item in chat |
+| Right-click row | Hide the item from this scan's results |
+| Ctrl+Right-click row | Always ignore the item (`/vd unignore <id>` to undo) |
+| Column header | Sort by that column (click again to reverse) |
+| **Min profit per listing** | Hide listings that beat vendor price by less than this, e.g. `50s`, `1g 20s` (press Enter) |
+| **Skip** | Drop the current item and move to the next |
+| Shift-click **Scan** | Try a full scan even if the 15-minute timer hasn't run out |
+
+### Slash commands
+
+```
+/vd                     toggle the window
+/vd scan                start a full scan
+/vd minprofit 50s       set the minimum profit per listing
+/vd ignore <link|id>    never show an item
+/vd unignore <link|id>  stop ignoring an item  (/vd unignore all clears the list)
+/vd autoopen            toggle opening with the Auction House
+/vd reset               reset the window position
+```
+
+The Buy button is a named frame (`VendorDiffBuyButton`), so a `/click VendorDiffBuyButton` macro bound to a key may work as well. This hasn't been tested on Forever.
+
+## How it works
+
+- **Scan:** calls `C_AuctionHouse.ReplicateItems()` and walks the result in small time slices so the game doesn't freeze, even on a very large auction house. For each listing with a buyout, it compares the buyout to `count × vendor sell price` from `C_Item.GetItemInfo`. Listings for items whose data isn't cached yet are retried for a few seconds.
+- **Verify:** before you can buy, a live `C_AuctionHouse.SendSearchQuery` fetches the item's current listings. Only listings that are still below vendor price, and aren't your own, become buyable. The list row updates to the live numbers.
+- **Buy:** `C_AuctionHouse.PlaceBid` for items. `StartCommoditiesPurchase` / `ConfirmCommoditiesPurchase` for commodities. After each purchase the item is searched again, so the next click always acts on fresh data.
+- **Profit tracking:** a purchase is counted only once the gold actually leaves your bags. The session total appears at the bottom of the window.
+
+## Caveats
+
+- **Not yet tested in the live game.** It was built against Blizzard's generated API documentation for the Forever client (build 1.60.1.71037) and tested against a mock of that API (see below). Report anything that behaves oddly.
+- **Settings may not persist on some Forever builds.** Some Forever builds write addon SavedVariables but don't load them at the next start. If that affects you, your min-profit setting and ignore list reset at login. Everything else works without saved data.
+- **Gear vendor prices** are read from the specific item link. If an item's real sell price differs from what the client reports, the profit shown can be off. Hover a row to see the item's actual tooltip sell price.
+- Blizzard's own Auction House window may also react to searches or commodity quotes that Vendor Diff makes.
+- Profit is vendor value minus buyout. It doesn't account for the trip to the mailbox and vendor.
+
+## Development
+
+The addon is plain Lua 5.1 with no libraries:
+
+| File | Role |
+| --- | --- |
+| `VendorDiff/Core.lua` | Namespace, events, settings, money and vendor-price helpers, slash commands |
+| `VendorDiff/Results.lua` | Deals grouped per item, min-profit filtering, sorting |
+| `VendorDiff/Scan.lua` | Time-sliced full-scan processing with retries for uncached items |
+| `VendorDiff/Backend_Modern.lua` | `C_AuctionHouse` scan, live search, and purchase calls |
+| `VendorDiff/Buyer.lua` | The select, search, buy, confirm, next state machine |
+| `VendorDiff/UI.lua` | The window |
+
+Tests run the real addon files against a strict mock of the Forever client API (`tests/wowmock.lua`). The mock simulates the Auction House, slow-loading item data, the query throttle, and timers. It errors on unknown widget methods, unknown events, and any purchase call made outside a simulated click:
+
+```bash
+lua5.1 tests/run_tests.lua
+luacheck VendorDiff
+```
